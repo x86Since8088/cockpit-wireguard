@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>WireGuard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="wireguard.css">
+    <script src="../base1/cockpit.js"></script>
+    <script src="wireguard.js" defer></script>
+</head>
+<body>
+    <div class="wg-page">
+
+        <header class="wg-topbar">
+            <div class="wg-topbar-title">
+                <h1>WireGuard</h1>
+                <span id="wg-host" class="wg-subtle"></span>
+            </div>
+            <div class="wg-topbar-actions">
+                <span id="wg-updated" class="wg-subtle"></span>
+                <label class="wg-check">
+                    <input type="checkbox" id="wg-auto" checked>
+                    <span>Auto-refresh</span>
+                </label>
+                <button type="button" id="wg-refresh" class="wg-btn">Refresh now</button>
+            </div>
+        </header>
+
+        <div id="wg-banner"></div>
+
+        <section id="wg-summary" class="wg-summary"></section>
+
+        <section class="wg-section">
+            <h2>Host tunnels</h2>
+            <div id="wg-host-body"></div>
+        </section>
+
+        <section class="wg-section">
+            <h2>Containerised wg-easy</h2>
+            <div id="wg-easy-body"></div>
+        </section>
+
+        <section class="wg-section">
+            <h2>Routing &amp; NAT</h2>
+            <div id="wg-nat-body"></div>
+        </section>
+
+        <section class="wg-section">
+            <h2>Services</h2>
+            <div id="wg-units-body"></div>
+        </section>
+
+        <footer class="wg-footer">
+            <span class="wg-subtle">Read-only view. This page never changes WireGuard, NetworkManager,
+            systemd or firewall state, and never displays private or pre-shared keys.</span>
+        </footer>
+    </div>
+</body>
+</html>
