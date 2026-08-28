@@ -248,6 +248,287 @@
     }
 
     /* ------------------------------------------------------------------ *
+     * Actions - schema-driven, confirmed, runtime-only
+     *
+     * The monitoring above stays read-only. The ONLY mutations this page
+     * performs are explicit `wg set` commands on host interfaces, each one
+     * shown verbatim in a dialog before it runs. They change the kernel's
+     * runtime state and nothing else: no NetworkManager profiles, no
+     * config files, no systemd units, no firewall rules. Every successful
+     * submit ends in poll(true), so the page repaints from re-read data.
+     * ------------------------------------------------------------------ */
+
+    function runAction(argv) {
+        return cockpit.spawn(argv, { superuser: "try", err: "message" });
+    }
+
+    var RE_B64KEY  = "^[A-Za-z0-9+/]{43}=$";
+    var RE_CIDR    = "^[0-9a-fA-F.:]+/[0-9]{1,3}$";
+    var RE_ENDPOINT = "^\\[?[A-Za-z0-9.:_-]+\\]?:[0-9]{1,5}$";
+
+    var PERSIST_NOTE = "Runtime change (wg set): it takes effect immediately but lives in the " +
+        "kernel only. wg0 on this host is brought up by NetworkManager (connection " +
+        NM_CONNECTION + ", generated from netplan), so make the same change there for it " +
+        "to survive a reconnect or reboot.";
+
+    function peerAddSchema(ifaceName) {
+        return {
+            title: "Add peer to " + ifaceName,
+            intro: PERSIST_NOTE,
+            fields: [
+                { id: "pubkey", label: "Public key", type: "text", required: true, span2: true,
+                  placeholder: "base64, 44 characters ending in =",
+                  pattern: RE_B64KEY, patternHint: "a 44-character base64 WireGuard public key",
+                  help: "From `wg pubkey` on the peer. Never paste a private key here." },
+                { id: "allowed", label: "Allowed IPs", type: "list", required: true, span2: true,
+                  placeholder: "10.20.0.12/32",
+                  itemPattern: RE_CIDR, itemHint: "a CIDR like 10.20.0.12/32",
+                  help: "One CIDR per line. Both routing and firewall for this peer — keep it tight; /32 for a single client." },
+                { id: "endpoint", label: "Endpoint", type: "text",
+                  placeholder: "host:51820", pattern: RE_ENDPOINT,
+                  patternHint: "host:port",
+                  help: "Optional; only for peers with a stable address." },
+                { id: "keepalive", label: "Persistent keepalive (s)", type: "int",
+                  min: 0, max: 3600, placeholder: "25",
+                  help: "Optional; 25 is the usual value for peers behind NAT." }
+            ],
+            submitLabel: "Add peer",
+            build: function (v) {
+                var a = ["wg", "set", ifaceName, "peer", v.pubkey,
+                         "allowed-ips", v.allowed.join(",")];
+                if (v.endpoint) a.push("endpoint", v.endpoint);
+                if (v.keepalive !== "" && v.keepalive !== null && v.keepalive !== undefined)
+                    a.push("persistent-keepalive", String(v.keepalive));
+                return [a];
+            }
+        };
+    }
+
+    function listenPortSchema(iface) {
+        return {
+            title: "Set listen port on " + iface.name,
+            intro: PERSIST_NOTE,
+            fields: [
+                { id: "port", label: "Listen port (UDP)", type: "int", required: true,
+                  min: 1, max: 65535, value: iface.listenPort || "",
+                  help: "Peers connect to this port; remember to forward it on the edge router." }
+            ],
+            submitLabel: "Set port",
+            build: function (v) {
+                return [["wg", "set", iface.name, "listen-port", String(v.port)]];
+            }
+        };
+    }
+
+    function peerRemoveSchema(ifaceName, publicKey) {
+        return {
+            title: "Remove peer from " + ifaceName,
+            intro: "The peer's tunnel stops working immediately. " + PERSIST_NOTE,
+            fields: [],
+            danger: true,
+            submitLabel: "Remove peer",
+            build: function () {
+                return [["wg", "set", ifaceName, "peer", publicKey, "remove"]];
+            }
+        };
+    }
+
+    /*
+     * The generic form dialog: renders a schema's fields, validates them,
+     * previews the exact argv, runs it. Adding an action is adding a schema
+     * above — no new UI code.
+     */
+    function schemaForm(schema) {
+        var root = $("wg-modal-root");
+        clear(root);
+
+        var getters = {};
+        var errNodes = {};
+        var previewPre = el("pre", { cls: "wg-rules" });
+        var errBox = el("div");
+        var busyNote = el("div", { cls: "wg-hint" });
+        var submitBtn;
+
+        function close() {
+            clear(root);
+            document.removeEventListener("keydown", onKey);
+        }
+
+        function onKey(ev) {
+            if (ev.key === "Escape") close();
+        }
+
+        function collect() {
+            var v = {};
+            Object.keys(getters).forEach(function (id) { v[id] = getters[id](); });
+            return v;
+        }
+
+        function setErr(f, msg) {
+            clear(errNodes[f.id]);
+            if (msg)
+                errNodes[f.id].appendChild(el("div", { cls: "wg-ferr", text: msg }));
+        }
+
+        function validate(values) {
+            var ok = true;
+            schema.fields.forEach(function (f) {
+                var val = values[f.id];
+                var msg = null;
+                if (f.type === "list") {
+                    if (f.required && !val.length)
+                        msg = "At least one entry is required.";
+                    else if (f.itemPattern) {
+                        var re = new RegExp(f.itemPattern);
+                        for (var i = 0; i < val.length; i++) {
+                            if (!re.test(val[i])) {
+                                msg = "“" + val[i] + "” is not " + (f.itemHint || "valid") + ".";
+                                break;
+                            }
+                        }
+                    }
+                } else if (f.type === "int") {
+                    var s = String(val === null || val === undefined ? "" : val).trim();
+                    if (f.required && s === "")
+                        msg = "Required.";
+                    else if (s !== "") {
+                        var n = Number(s);
+                        if (!isFinite(n) || Math.floor(n) !== n)
+                            msg = "Must be a whole number.";
+                        else if ((f.min !== undefined && n < f.min) ||
+                                 (f.max !== undefined && n > f.max))
+                            msg = "Must be between " + f.min + " and " + f.max + ".";
+                    }
+                } else {
+                    var t = String(val || "").trim();
+                    if (f.required && !t)
+                        msg = "Required.";
+                    else if (t && f.pattern && !new RegExp(f.pattern).test(t))
+                        msg = "Must be " + (f.patternHint || "valid") + ".";
+                }
+                setErr(f, msg);
+                if (msg) ok = false;
+            });
+            return ok;
+        }
+
+        function commands(values) {
+            try { return schema.build(values) || []; } catch (e) { return []; }
+        }
+
+        function updatePreview() {
+            var cmds = commands(collect());
+            previewPre.textContent = cmds.length
+                ? cmds.map(function (a) { return a.join(" "); }).join("\n")
+                : "(no command yet)";
+        }
+
+        function fieldNode(f) {
+            var wrap = el("div", { cls: "wg-field" + (f.span2 ? " wg-span2" : "") });
+            errNodes[f.id] = el("div");
+
+            var label = el("label", {}, f.label,
+                f.required ? el("span", { cls: "wg-req", text: "*" }) : "");
+
+            var control;
+            if (f.type === "list") {
+                control = el("textarea", { cls: "wg-textarea",
+                    attrs: { rows: "3", placeholder: f.placeholder || "" } });
+                if (f.value) control.value = f.value;
+                getters[f.id] = function () {
+                    return control.value.split("\n")
+                        .map(function (s) { return s.trim(); })
+                        .filter(Boolean);
+                };
+            } else {
+                control = el("input", { cls: "wg-input",
+                    attrs: { type: "text", placeholder: f.placeholder || "" } });
+                if (f.value !== undefined && f.value !== null && f.value !== "")
+                    control.value = String(f.value);
+                getters[f.id] = function () { return control.value.trim(); };
+            }
+            control.addEventListener("input", updatePreview);
+
+            wrap.appendChild(label);
+            wrap.appendChild(control);
+            if (f.help) wrap.appendChild(el("div", { cls: "wg-fhelp", text: f.help }));
+            wrap.appendChild(errNodes[f.id]);
+            return wrap;
+        }
+
+        function onSubmit() {
+            var values = collect();
+            clear(errBox);
+            if (!validate(values)) return;
+            var cmds = commands(values);
+            if (!cmds.length) return;
+
+            submitBtn.disabled = true;
+            clear(busyNote);
+            busyNote.appendChild(el("span", { cls: "wg-spin" }));
+            busyNote.appendChild(document.createTextNode(" Running…"));
+
+            var chain = Promise.resolve();
+            cmds.forEach(function (argv) {
+                chain = chain.then(function () { return runAction(argv); });
+            });
+            chain.then(function () {
+                close();
+                poll(true);
+            }).catch(function (err) {
+                var msg = (err && (err.message || err.problem)) || String(err);
+                submitBtn.disabled = false;
+                clear(busyNote);
+                var box = el("div", { cls: "wg-alert bad" });
+                box.appendChild(el("h3", { text: isPermissionError(msg)
+                    ? "Administrative access required"
+                    : "The command failed" }));
+                box.appendChild(el("div", { cls: "wg-subtle", text: isPermissionError(msg)
+                    ? "wg set needs root and it was not granted, so nothing was changed."
+                    : "Nothing was changed. wg reported:" }));
+                box.appendChild(el("pre", { cls: "wg-rules", text: String(msg).trim() }));
+                errBox.appendChild(box);
+            });
+        }
+
+        submitBtn = el("button", { cls: "wg-btn primary" + (schema.danger ? " danger" : ""),
+                                   attrs: { type: "button" }, text: schema.submitLabel });
+        submitBtn.addEventListener("click", onSubmit);
+
+        var cancelBtn = el("button", { cls: "wg-btn", attrs: { type: "button" }, text: "Cancel" });
+        cancelBtn.addEventListener("click", close);
+
+        var body = el("div", { cls: "wg-modal-body" });
+        if (schema.intro) body.appendChild(el("p", { cls: "wg-hint", text: schema.intro }));
+        if (schema.fields.length) {
+            var grid = el("div", { cls: "wg-form-grid" });
+            schema.fields.forEach(function (f) { grid.appendChild(fieldNode(f)); });
+            body.appendChild(grid);
+        }
+        body.appendChild(el("div", { cls: "wg-subtle", text: "Command to be run:" }));
+        body.appendChild(previewPre);
+        body.appendChild(errBox);
+        body.appendChild(busyNote);
+
+        var dialog = el("div", { cls: "wg-modal",
+                                 attrs: { role: "dialog", "aria-modal": "true" } },
+            el("div", { cls: "wg-modal-head", text: schema.title }),
+            body,
+            el("div", { cls: "wg-modal-foot" }, cancelBtn, submitBtn));
+
+        var backdrop = el("div", { cls: "wg-modal-backdrop" }, dialog);
+        backdrop.addEventListener("click", function (ev) {
+            if (ev.target === backdrop) close();
+        });
+
+        root.appendChild(backdrop);
+        document.addEventListener("keydown", onKey);
+        updatePreview();
+        var first = dialog.querySelector("input, textarea");
+        (first || submitBtn).focus();
+    }
+
+    /* ------------------------------------------------------------------ *
      * Parsers
      * ------------------------------------------------------------------ */
 
@@ -604,14 +885,16 @@
         box.appendChild(tile(fmtBytes(tx), "Sent"));
     }
 
-    function peerTable(peers) {
+    function peerTable(peers, ifaceName, managed) {
         if (!peers.length)
             return el("div", { cls: "wg-empty", text: "No peers configured on this interface." });
 
         var table = el("table", { cls: "wg-table" });
         var hrow = el("tr");
-        ["Peer public key", "Status", "Last handshake", "Endpoint", "Allowed IPs",
-         "Received", "Sent", "Keepalive", "PSK"].forEach(function (h) {
+        var headers = ["Peer public key", "Status", "Last handshake", "Endpoint", "Allowed IPs",
+                       "Received", "Sent", "Keepalive", "PSK"];
+        if (managed) headers.push("Actions");
+        headers.forEach(function (h) {
             hrow.appendChild(el("th", { text: h }));
         });
         table.appendChild(el("thead", {}, hrow));
@@ -662,6 +945,15 @@
             tr.appendChild(el("td", { cls: "nowrap", text: p.presharedKey ? "yes" : "no",
                 title: "pre-shared key values are never read or displayed" }));
 
+            if (managed) {
+                var rm = el("button", { cls: "wg-btn danger sm",
+                                        attrs: { type: "button" }, text: "Remove" });
+                rm.addEventListener("click", function () {
+                    schemaForm(peerRemoveSchema(ifaceName, p.publicKey));
+                });
+                tr.appendChild(el("td", { cls: "nowrap" }, rm));
+            }
+
             tbody.appendChild(tr);
         });
 
@@ -692,7 +984,7 @@
         return pill(up ? "up" : "down", up ? "ok" : "bad");
     }
 
-    function interfaceCard(iface, link, extras) {
+    function interfaceCard(iface, link, extras, managed) {
         var card = el("div", { cls: "wg-card" });
 
         var head = el("div", { cls: "wg-card-head" });
@@ -706,6 +998,23 @@
         head.appendChild(pill(n + (n === 1 ? " peer" : " peers")));
         if (n && bad) head.appendChild(pill(bad + " needing attention", "warn"));
         else if (n)   head.appendChild(pill("all peers healthy", "ok"));
+
+        if (managed) {
+            var actions = el("span", { cls: "wg-actions" });
+            var addBtn = el("button", { cls: "wg-btn primary sm",
+                                        attrs: { type: "button" }, text: "Add peer" });
+            addBtn.addEventListener("click", function () {
+                schemaForm(peerAddSchema(iface.name));
+            });
+            var portBtn = el("button", { cls: "wg-btn sm",
+                                         attrs: { type: "button" }, text: "Set port" });
+            portBtn.addEventListener("click", function () {
+                schemaForm(listenPortSchema(iface));
+            });
+            actions.appendChild(addBtn);
+            actions.appendChild(portBtn);
+            head.appendChild(actions);
+        }
         card.appendChild(head);
 
         var dl = el("dl", { cls: "wg-dl" });
@@ -725,7 +1034,7 @@
         (extras || []).forEach(function (e) { row(e[0], e[1]); });
 
         card.appendChild(el("div", { cls: "wg-card-body" }, dl));
-        card.appendChild(peerTable(iface.peers));
+        card.appendChild(peerTable(iface.peers, iface.name, managed));
         return card;
     }
 
@@ -749,7 +1058,7 @@
                 var extras = [];
                 var nm = nmNodeFor(iface.name);
                 if (nm) extras.push(["NetworkManager", nm]);
-                box.appendChild(interfaceCard(iface, state.host.addrs[iface.name], extras));
+                box.appendChild(interfaceCard(iface, state.host.addrs[iface.name], extras, true));
             });
             return;
         }

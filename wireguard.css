@@ -201,6 +201,7 @@ a, a:visited { color: var(--wg-accent); }
 }
 .wg-card-head .name { font-size: 1rem; font-weight: 600; font-family: var(--wg-mono); }
 .wg-card-head a { margin-left: auto; font-size: 0.85rem; white-space: nowrap; }
+.wg-card-head .wg-actions { margin-left: auto; display: flex; gap: 0.4rem; flex-wrap: wrap; }
 .wg-card-body { padding: 0.75rem 0.85rem; }
 
 /* ---------- definition grid ---------- */
@@ -286,6 +287,100 @@ tr.peer-never { background: var(--wg-bad-bg); }
 }
 .keybtn:hover { color: var(--wg-accent); border-bottom-color: var(--wg-accent); }
 .keybtn:focus-visible { outline: 2px solid var(--wg-accent); outline-offset: 1px; }
+
+/* ---------- action buttons ---------- */
+
+.wg-btn.primary {
+    background: var(--wg-accent);
+    border-color: var(--wg-accent);
+    color: #ffffff;
+}
+html.wg-dark .wg-btn.primary { color: #10141a; }
+.wg-btn.primary:hover:not(:disabled) { filter: brightness(0.92); background: var(--wg-accent); }
+.wg-btn.danger { border-color: var(--wg-bad-fg); color: var(--wg-bad-fg); }
+.wg-btn.danger:hover:not(:disabled) { background: var(--wg-bad-bg); }
+.wg-btn.sm { font-size: 0.78rem; padding: 0.12rem 0.5rem; }
+
+.wg-spin {
+    display: inline-block;
+    width: 0.85rem;
+    height: 0.85rem;
+    border: 2px solid var(--wg-border);
+    border-top-color: var(--wg-accent);
+    border-radius: 50%;
+    animation: wg-rotate 0.8s linear infinite;
+    vertical-align: -0.1rem;
+}
+@keyframes wg-rotate { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .wg-spin { animation-duration: 3s; } }
+
+/* ---------- modal + schema forms ---------- */
+
+.wg-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(3, 3, 3, 0.62);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    z-index: 500;
+}
+
+.wg-modal {
+    background: var(--wg-card);
+    color: var(--wg-fg);
+    border: 1px solid var(--wg-border);
+    border-radius: 6px;
+    box-shadow: 0 8px 32px rgba(3, 3, 3, 0.4);
+    max-width: 34rem;
+    width: 100%;
+    max-height: 90vh;
+    overflow-y: auto;
+}
+
+.wg-modal-head { padding: 1rem 1rem 0.5rem; font-size: 1.1rem; font-weight: 600; }
+.wg-modal-body { padding: 0 1rem 1rem; }
+.wg-modal-foot {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    border-top: 1px solid var(--wg-border-soft);
+}
+
+.wg-form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.9rem 1.25rem;
+    margin-top: 0.5rem;
+}
+
+.wg-field label { display: block; font-weight: 600; font-size: 0.875rem; margin-bottom: 0.2rem; }
+.wg-field .wg-req { color: var(--wg-bad-fg); margin-left: 0.15rem; }
+.wg-field .wg-fhelp { color: var(--wg-fg-muted); font-size: 0.8rem; margin-top: 0.2rem; }
+.wg-field .wg-ferr { color: var(--wg-bad-fg); font-size: 0.8rem; margin-top: 0.2rem; }
+.wg-field.wg-span2 { grid-column: 1 / -1; }
+
+.wg-input, .wg-textarea {
+    font: inherit;
+    font-size: 0.9rem;
+    color: var(--wg-fg);
+    background: var(--wg-card);
+    border: 1px solid var(--wg-border);
+    border-radius: 4px;
+    padding: 0.35rem 0.6rem;
+    width: 100%;
+}
+.wg-input:focus-visible, .wg-textarea:focus-visible {
+    outline: 2px solid var(--wg-accent);
+    outline-offset: 1px;
+}
+.wg-textarea { font-family: var(--wg-mono); font-size: 0.85rem; resize: vertical; }
+
+@media (max-width: 640px) {
+    .wg-form-grid { grid-template-columns: 1fr; }
+}
 
 /* ---------- misc ---------- */
 

@@ -51,9 +51,11 @@
         </section>
 
         <footer class="wg-footer">
-            <span class="wg-subtle">Read-only view. This page never changes WireGuard, NetworkManager,
-            systemd or firewall state, and never displays private or pre-shared keys.</span>
+            <span class="wg-subtle">Monitoring is read-only and live. The only state this page can change
+            is host WireGuard peers and listen ports via explicit, confirmed “wg set” commands — it never
+            touches NetworkManager, systemd or firewall state, and never displays private or pre-shared keys.</span>
         </footer>
     </div>
+    <div id="wg-modal-root"></div>
 </body>
 </html>
