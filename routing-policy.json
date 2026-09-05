@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "tag": "cockpit-wg",
+  "note": [
+    "Stored routing policy for the WireGuard tunnels on this host. This file is",
+    "the DESIRED state; `wg-policy apply` reconciles the live iptables/sysctl",
+    "state to match it, and `wg-policy check` reports drift without changing",
+    "anything.",
+    "",
+    "Why this exists: the forwarding and NAT rules are VOLATILE. podman, libvirt",
+    "and docker rebuild their chains on restart, and anything that flushes the",
+    "filter or nat table silently strips these rules. Boot-time persistence",
+    "(wg-lan-nat.service and its drop-ins) only covers a reboot, so a client that",
+    "connects after a container-engine restart finds a tunnel that comes up",
+    "cleanly and routes nothing. wg-policy-watch reconciles on every new client",
+    "handshake to close that window.",
+    "",
+    "Every rule deployed from this file carries the iptables comment",
+    "'cockpit-wg:<dest-id>', which is both how drift is detected and the only",
+    "thing this tool will ever delete."
+  ],
+
+  "sysctl": {
+    "net.ipv4.ip_forward": "1"
+  },
+
+  "gateway": {
+    "address": "192.168.2.254",
+    "egress_interface": "bridge0",
+    "note": "Internet traffic from every tunnel must leave via this gateway."
+  },
+
+  "tunnels": [
+    {
+      "id": "wg0",
+      "interface": "wg0",
+      "cidr": "172.16.0.0/24",
+      "listen_port": 51820,
+      "public_port": 1911,
+      "extra_source_cidrs": ["172.16.2.0/25"],
+      "note": "extra_source_cidrs are networks reached THROUGH a peer (the ELT static range); they need the same egress NAT as the tunnel subnet itself."
+    }
+  ],
+
+  "destinations": [
+    {
+      "id": "lan",
+      "cidr": "192.168.2.0/24",
+      "iface": "bridge0",
+      "forward": true,
+      "masquerade": true,
+      "note": "The physical LAN. NAT is required: a LAN host replying to a 172.16.x source has no route back, since the router only knows 192.168.2.0/24."
+    },
+    {
+      "id": "wg-shim",
+      "cidr": "192.168.2.250/32",
+      "iface": "wg-shim",
+      "forward": true,
+      "masquerade": true,
+      "note": "The wg-easy container's macvlan address, reached over a dedicated shim rather than bridge0."
+    },
+    {
+      "id": "lab",
+      "cidr": "172.16.4.0/24",
+      "iface": "br-lab-edt",
+      "forward": true,
+      "masquerade": true
+    },
+    {
+      "id": "static-edt",
+      "cidr": "172.15.4.0/24",
+      "iface": "br-static-edt",
+      "forward": true,
+      "masquerade": true
+    },
+    {
+      "id": "edy-lab",
+      "cidr": "172.20.10.0/24",
+      "iface": "virbr-edy",
+      "forward": true,
+      "masquerade": true,
+      "note": "libvirt network. LIBVIRT_FWI REJECTs anything egressing virbr-edy that is not already RELATED,ESTABLISHED, so the FORWARD rules MUST be inserted at the top of the chain, never appended."
+    },
+    {
+      "id": "libvirt-default",
+      "cidr": "192.168.122.0/24",
+      "iface": "virbr0",
+      "forward": true,
+      "masquerade": true,
+      "note": "The default libvirt network. Same LIBVIRT_FWI REJECT applies as for edy-lab. This destination was missing entirely: the host could reach 192.168.122.x while every tunnel client could not."
+    },
+    {
+      "id": "podman0",
+      "cidr": "10.88.0.0/16",
+      "iface": "podman0",
+      "forward": true,
+      "masquerade": false,
+      "note": "No NAT needed: the host IS these containers' gateway and already routes 172.16.0.0/24 back down wg0, so replies find their way home unmasqueraded. The FORWARD rules are still declared so the path does not depend on the chain policy staying ACCEPT."
+    },
+    {
+      "id": "podman2",
+      "cidr": "172.30.10.0/24",
+      "iface": "podman2",
+      "forward": true,
+      "masquerade": false,
+      "note": "The reverse-proxy pod network (edy-rproxy-*). Same reasoning as podman0."
+    },
+    {
+      "id": "podman3",
+      "cidr": "10.90.0.0/24",
+      "iface": "podman3",
+      "forward": true,
+      "masquerade": false,
+      "note": "The edy-dev pod network. Same reasoning as podman0."
+    },
+    {
+      "id": "full",
+      "cidr": "0.0.0.0/0",
+      "iface": "bridge0",
+      "forward": true,
+      "masquerade": true,
+      "note": "Default route: everything not matched above egresses bridge0 to the gateway and is masqueraded onto the LAN address."
+    }
+  ]
+}

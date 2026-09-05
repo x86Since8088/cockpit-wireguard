@@ -235,15 +235,38 @@
     function isPermissionError(msg) { return PERM_RE.test(String(msg || "")); }
 
     /* Resolves to { ok, data } or { ok:false, error, denied }. Never rejects. */
+    /*
+     * Cockpit reports privilege failures as a `problem` code, not prose, and the
+     * codes are hyphenated ("access-denied") so a prose regex never matches them.
+     * Check the code first; on a privilege/channel failure retry ONCE with
+     * superuser:"require" so the user gets a real authentication prompt instead
+     * of a silent unprivileged downgrade.
+     */
+    var DENY_PROBLEMS = { "access-denied": 1, "authentication-failed": 1,
+                          "not-authorized": 1, "cancelled": 1 };
+    var CHANNEL_PROBLEMS = { "internal-error": 1, "protocol-error": 1,
+                             "terminated": 1, "disconnected": 1 };
+
     function probe(script) {
-        return cockpit.spawn(["/bin/sh", "-c", script],
-                             { superuser: "try", err: "message" })
+        var argv = ["/bin/sh", "-c", script];
+
+        function fail(err) {
+            var problem = (err && err.problem) ? String(err.problem) : "";
+            var msg = (err && (err.message || err.problem)) || String(err);
+            return { ok: false, error: String(msg).trim(),
+                     denied: !!DENY_PROBLEMS[problem] || isPermissionError(msg) };
+        }
+
+        return cockpit.spawn(argv, { superuser: "try", err: "message" })
             .then(function (out) {
                 return { ok: true, data: out };
             }, function (err) {
-                var msg = (err && (err.message || err.problem)) || String(err);
-                return { ok: false, error: String(msg).trim(),
-                         denied: isPermissionError(msg) };
+                var problem = (err && err.problem) ? String(err.problem) : "";
+                if (!DENY_PROBLEMS[problem] && !CHANNEL_PROBLEMS[problem] &&
+                    !isPermissionError(err && err.message))
+                    return fail(err);
+                return cockpit.spawn(argv, { superuser: "require", err: "message" })
+                    .then(function (out) { return { ok: true, data: out }; }, fail);
             });
     }
 
@@ -1329,6 +1352,23 @@
         render();
         poll(true);
         schedule();
+
+        /*
+         * The client manager is a separate module (wgclient.js) - the only part
+         * of this page that manages CLIENT configs (the schema modals above
+         * manage host peers). Guarded: if it failed to load, the rest of the
+         * page must still work.
+         */
+        try {
+            if (window.WGClient)
+                WGClient.render(document.getElementById("wg-clients"), { heading: false });
+            else
+                document.getElementById("wg-clients").textContent =
+                    "Client management did not load (wgclient.js missing).";
+        } catch (e) {
+            document.getElementById("wg-clients").textContent =
+                "Client management failed to start: " + e;
+        }
 
         /* Handshake ages must keep ticking between polls. */
         window.setInterval(function () {

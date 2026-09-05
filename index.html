@@ -6,6 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="wireguard.css">
     <script src="../base1/cockpit.js"></script>
+    <script src="wgclient.js" defer></script>
     <script src="wireguard.js" defer></script>
 </head>
 <body>
@@ -50,10 +51,17 @@
             <div id="wg-units-body"></div>
         </section>
 
+        <section class="wg-section">
+            <h2>Clients</h2>
+            <div id="wg-clients"></div>
+        </section>
+
         <footer class="wg-footer">
-            <span class="wg-subtle">Monitoring is read-only and live. The only state this page can change
-            is host WireGuard peers and listen ports via explicit, confirmed “wg set” commands — it never
-            touches NetworkManager, systemd or firewall state, and never displays private or pre-shared keys.</span>
+            <span class="wg-subtle">Monitoring is read-only and live. Two sections change state, both only
+            with administrative access: host peers and listen ports via explicit, confirmed “wg set”
+            commands, and the <strong>Clients</strong> section, which creates keys, writes peer entries, and can
+            change forwarding and NAT rules. Generated client configurations contain a private key and are
+            masked until you choose to reveal them.</span>
         </footer>
     </div>
     <div id="wg-modal-root"></div>

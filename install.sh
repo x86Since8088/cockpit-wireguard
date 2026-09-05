@@ -26,7 +26,13 @@ SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DESTDIR="${DESTDIR:-}"
 PKGDIR="${DESTDIR}/usr/share/cockpit/wireguard"
 
-FILES=(manifest.json index.html wireguard.js wireguard.css)
+FILES=(manifest.json index.html wireguard.js wgclient.js wireguard.css)
+
+# Host-side helpers and the stored routing policy. These are NOT Cockpit package
+# files: they live in /usr/local/sbin and /etc/wireguard, and the watch unit is a
+# systemd service. Installed only when --with-policy is passed, so a plain UI
+# install cannot silently start changing firewall state.
+POLICY_FILES=(routing-policy.json wg-policy wg-policy-watch wg-policy-watch.service)
 
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 say() { printf '  %s\n' "$*"; }
@@ -88,3 +94,20 @@ shopt -u nullglob
 echo
 echo "Done. Reload Cockpit in the browser (log out and back in to pick up the"
 echo "menu entry). Cockpit itself was not restarted and no system state changed."
+
+# --with-policy: install the routing-policy reconciler and its watch unit.
+if [[ "${WITH_POLICY:-0}" == "1" || "${1:-}" == "--with-policy" ]]; then
+    for f in "${POLICY_FILES[@]}"; do
+        [[ -f "$SRC/$f" ]] || die "missing policy file: $SRC/$f"
+    done
+    install -D -m 0644 -o root -g root "$SRC/routing-policy.json"      "${DESTDIR}/etc/wireguard/routing-policy.json"
+    install -D -m 0755 -o root -g root "$SRC/wg-policy"                "${DESTDIR}/usr/local/sbin/wg-policy"
+    install -D -m 0755 -o root -g root "$SRC/wg-policy-watch"          "${DESTDIR}/usr/local/sbin/wg-policy-watch"
+    install -D -m 0644 -o root -g root "$SRC/wg-policy-watch.service"  "${DESTDIR}/etc/systemd/system/wg-policy-watch.service"
+    say "installed routing policy + reconciler"
+    if [[ -z "$DESTDIR" ]]; then
+        systemctl daemon-reload
+        say "run: systemctl enable --now wg-policy-watch.service"
+        say "check drift any time with: wg-policy check"
+    fi
+fi

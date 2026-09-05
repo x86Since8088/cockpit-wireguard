@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+#
+# wg-policy - reconcile the host's VOLATILE routing/NAT state against the stored
+#             routing policy (routing-policy.json).
+#
+#   wg-policy check    report drift; exit 1 if the live state does not match
+#   wg-policy apply    install whatever is missing (idempotent)
+#   wg-policy show     print the policy as a table
+#   wg-policy status   JSON summary, for the Cockpit panel
+#
+# WHY THIS EXISTS
+#   The forward/masquerade rules that make a tunnel useful are volatile. podman,
+#   libvirt and docker rebuild their chains whenever their daemons restart, and
+#   any full flush of the filter/nat tables strips these rules outright. The
+#   boot-time unit (wg-lan-nat.service) only covers a reboot. So a client can
+#   complete a handshake against a perfectly healthy tunnel and still route
+#   nothing, because the forwarding rules disappeared hours earlier. This tool is
+#   what closes that window, and wg-policy-watch runs it on every new handshake.
+#
+# TAGGING
+#   Every rule installed from the policy carries an iptables comment
+#   'cockpit-wg:<dest-id>'. That tag is how drift is detected and is the ONLY
+#   thing this tool will ever delete -- rules owned by wg-admin, wg-lan-nat or
+#   anything else are left strictly alone, and an equivalent untagged rule is
+#   accepted as satisfying the policy rather than duplicated.
+#
+# FORWARD ORDERING
+#   FORWARD rules are INSERTED at the top, never appended. libvirt jumps to
+#   LIBVIRT_FWI from FORWARD, and that chain REJECTs anything egressing virbr0 or
+#   virbr-edy that is not already RELATED,ESTABLISHED. An appended ACCEPT lands
+#   after that jump and is never reached -- while `iptables -C` still reports the
+#   rule present, so the rule reads as installed while traffic is silently
+#   dropped. nat/POSTROUTING is unaffected (LIBVIRT_PRT only matches the libvirt
+#   source nets), so masquerade rules are appended normally.
+
+set -Eeuo pipefail
+
+POLICY="${WG_POLICY_FILE:-/etc/wireguard/routing-policy.json}"
+TAG_DEFAULT="cockpit-wg"
+
+die() { printf 'wg-policy: %s\n' "$*" >&2; exit 1; }
+
+[[ -r "$POLICY" ]] || die "policy file not readable: $POLICY"
+command -v jq >/dev/null 2>&1 || die "jq is required"
+command -v iptables >/dev/null 2>&1 || die "iptables is required"
+
+TAG="$(jq -r '.tag // "'"$TAG_DEFAULT"'"' "$POLICY")"
+GW_ADDR="$(jq -r '.gateway.address // empty' "$POLICY")"
+GW_IF="$(jq -r '.gateway.egress_interface // empty' "$POLICY")"
+
+comment_for() { printf -- '-m comment --comment %s:%s' "$TAG" "$1"; }
+
+# Every source CIDR that must be NATed: each tunnel's own subnet plus any
+# networks reached through a peer.
+source_cidrs() {
+    jq -r '.tunnels[] | (.cidr, (.extra_source_cidrs // [])[])' "$POLICY"
+}
+tunnel_ifaces() { jq -r '.tunnels[].interface' "$POLICY"; }
+
+# rules_for <dest-id>
+# Emits "TABLE|CHAIN|ARGS" lines for one destination, expanded across every
+# tunnel interface and source CIDR.
+rules_for() {
+    local id="$1" cidr iface fwd masq wgif src
+    cidr="$(jq -r --arg i "$id" '.destinations[]|select(.id==$i)|.cidr' "$POLICY")"
+    iface="$(jq -r --arg i "$id" '.destinations[]|select(.id==$i)|.iface' "$POLICY")"
+    fwd="$(jq -r --arg i "$id" '.destinations[]|select(.id==$i)|.forward' "$POLICY")"
+    masq="$(jq -r --arg i "$id" '.destinations[]|select(.id==$i)|.masquerade' "$POLICY")"
+    [[ -n "$cidr" && -n "$iface" ]] || return 1
+
+    # An interface that does not exist yet is not an error: the podman/libvirt
+    # bridge may simply be down. Its rules are skipped and reported as such.
+    ip link show "$iface" >/dev/null 2>&1 || return 2
+
+    while read -r wgif; do
+        [[ -n "$wgif" ]] || continue
+        [[ "$iface" == "$wgif" ]] && continue   # egress on the tunnel itself needs nothing
+        if [[ "$fwd" == "true" ]]; then
+            printf 'filter|FORWARD|-i %s -o %s -j ACCEPT|\n' "$wgif" "$iface"
+            # The reverse rule has two accepted spellings: stateful (what this
+            # policy prefers) and the plain ACCEPT that wg-lan-nat.service
+            # already installs for some segments. Either satisfies the policy;
+            # treating only one as valid would duplicate the other on every run.
+            printf 'filter|FORWARD|-i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT|-i %s -o %s -j ACCEPT\n' \
+                "$iface" "$wgif" "$iface" "$wgif"
+        fi
+    done < <(tunnel_ifaces)
+
+    if [[ "$masq" == "true" ]]; then
+        while read -r src; do
+            [[ -n "$src" ]] || continue
+            if [[ "$cidr" == "0.0.0.0/0" ]]; then
+                printf 'nat|POSTROUTING|-s %s ! -d %s -o %s -j MASQUERADE|\n' "$src" "$src" "$iface"
+            else
+                printf 'nat|POSTROUTING|-s %s -d %s -o %s -j MASQUERADE|\n' "$src" "$cidr" "$iface"
+            fi
+        done < <(source_cidrs)
+    fi
+    return 0
+}
+
+# A rule counts as satisfied if an equivalent exists under ANY owner's comment,
+# or none at all. `iptables -C` cannot express that: it demands an exact match
+# INCLUDING the comment, so a rule already installed as 'wg-admin:lab' would read
+# as missing and be duplicated on every reconcile. So compare against the live
+# chain with comments stripped instead.
+norm() { sed -E 's/-m comment --comment ("[^"]*"|[^ ]+)//g; s/  +/ /g; s/^ //; s/ $//'; }
+
+chain_dump() {   # cached per table/chain; these are hot in the survey loop
+    local table="$1" chain="$2" key="${1}_${2}"
+    local var="CHAIN_CACHE_${key}"
+    if [[ -z "${!var:-}" ]]; then
+        printf -v "$var" '%s' "$(iptables -t "$table" -S "$chain" 2>/dev/null | norm)"
+    fi
+    printf '%s' "${!var}"
+}
+
+rule_present() {
+    local table="$1" chain="$2" args="$3" alt="${4:-}" want dump
+    dump="$(chain_dump "$table" "$chain")"
+    want="$(printf -- '-A %s %s' "$chain" "$args" | norm)"
+    grep -Fxq -- "$want" <<<"$dump" && return 0
+    if [[ -n "$alt" ]]; then
+        want="$(printf -- '-A %s %s' "$chain" "$alt" | norm)"
+        grep -Fxq -- "$want" <<<"$dump" && return 0
+    fi
+    return 1
+}
+
+add_rule() {
+    local table="$1" chain="$2" args="$3" id="$4"
+    if [[ "$table" == "filter" && "$chain" == "FORWARD" ]]; then
+        # top of chain: must precede the LIBVIRT_FWI jump (see header)
+        # shellcheck disable=SC2086
+        iptables -t "$table" -I FORWARD 1 $args $(comment_for "$id")
+    else
+        # shellcheck disable=SC2086
+        iptables -t "$table" -A "$chain" $args $(comment_for "$id")
+    fi
+}
+
+sysctl_drift() {
+    local k v cur
+    while read -r k; do
+        v="$(jq -r --arg k "$k" '.sysctl[$k]' "$POLICY")"
+        cur="$(sysctl -n "$k" 2>/dev/null || echo '?')"
+        [[ "$cur" == "$v" ]] || printf '%s|%s|%s\n' "$k" "$v" "$cur"
+    done < <(jq -r '.sysctl|keys[]' "$POLICY")
+}
+
+gateway_ok() {
+    [[ -z "$GW_ADDR" ]] && return 0
+    ip route show default 2>/dev/null | grep -q "via ${GW_ADDR}\b"
+}
+
+dest_ids() { jq -r '.destinations[].id' "$POLICY"; }
+
+# Walk the whole policy. Prints one line per rule: STATE|TABLE|CHAIN|ARGS|ID
+# STATE is ok | missing | skipped(no-iface)
+survey() {
+    local id rc table chain args alt l
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        set +e
+        mapfile -t lines < <(rules_for "$id" 2>/dev/null); rc=$?
+        set -e
+        if (( rc == 2 )); then
+            printf 'skipped|-|-|interface down or absent|%s\n' "$id"
+            continue
+        fi
+        for l in "${lines[@]}"; do
+            [[ -n "$l" ]] || continue
+            IFS='|' read -r table chain args alt <<<"$l"
+            if rule_present "$table" "$chain" "$args" "$alt"; then
+                printf 'ok|%s|%s|%s|%s\n' "$table" "$chain" "$args" "$id"
+            else
+                printf 'missing|%s|%s|%s|%s\n' "$table" "$chain" "$args" "$id"
+            fi
+        done
+    done < <(dest_ids)
+}
+
+cmd_check() {
+    local missing=0 skipped=0 ok=0 state table chain args id
+    echo "policy: $POLICY   tag: ${TAG}:<dest>"
+    while IFS='|' read -r state table chain args id; do
+        case "$state" in
+            ok)      ok=$((ok+1)) ;;
+            missing) missing=$((missing+1)); printf '  MISSING  %-16s %s/%s %s\n' "$id" "$table" "$chain" "$args" ;;
+            skipped) skipped=$((skipped+1)); printf '  SKIPPED  %-16s %s\n' "$id" "$args" ;;
+        esac
+    done < <(survey)
+
+    local sd=0 k want cur
+    while IFS='|' read -r k want cur; do
+        [[ -n "$k" ]] || continue
+        sd=$((sd+1)); printf '  SYSCTL   %s is %s, policy wants %s\n' "$k" "$cur" "$want"
+    done < <(sysctl_drift)
+
+    local gwbad=0
+    if ! gateway_ok; then gwbad=1; printf '  GATEWAY  default route is not via %s\n' "$GW_ADDR"; fi
+
+    printf '  %d ok, %d missing, %d skipped, %d sysctl drift, gateway %s\n' \
+        "$ok" "$missing" "$skipped" "$sd" "$( ((gwbad)) && echo BAD || echo ok)"
+    (( missing == 0 && sd == 0 && gwbad == 0 ))
+}
+
+cmd_apply() {
+    local added=0 state table chain args id k want cur
+    while IFS='|' read -r state table chain args id; do
+        [[ "$state" == "missing" ]] || continue
+        add_rule "$table" "$chain" "$args" "$id"
+        added=$((added+1))
+        printf '  + %-16s %s/%s %s\n' "$id" "$table" "$chain" "$args"
+    done < <(survey)
+
+    while IFS='|' read -r k want cur; do
+        [[ -n "$k" ]] || continue
+        sysctl -w "$k=$want" >/dev/null && printf '  + sysctl %s=%s (was %s)\n' "$k" "$want" "$cur"
+        added=$((added+1))
+    done < <(sysctl_drift)
+
+    if ! gateway_ok; then
+        # Do NOT invent a default route: if the gateway is wrong the cause is
+        # upstream (DHCP, netplan, a downed link) and silently adding one here
+        # would mask it.
+        printf '  ! default route is not via %s -- NOT auto-added (upstream problem)\n' "$GW_ADDR" >&2
+    fi
+    printf '  reconciled: %d change(s)\n' "$added"
+}
+
+cmd_show() {
+    printf '  %-16s %-20s %-14s %-8s %s\n' ID CIDR IFACE FORWARD MASQUERADE
+    jq -r '.destinations[] | [.id,.cidr,.iface,(.forward|tostring),(.masquerade|tostring)] | @tsv' "$POLICY" |
+        while IFS=$'\t' read -r a b c d e; do printf '  %-16s %-20s %-14s %-8s %s\n' "$a" "$b" "$c" "$d" "$e"; done
+    echo
+    printf '  gateway: %s via %s\n' "$GW_ADDR" "$GW_IF"
+    printf '  tunnels: %s\n' "$(jq -r '[.tunnels[]|"\(.interface) \(.cidr)"]|join(", ")' "$POLICY")"
+}
+
+cmd_status() {
+    local ok=0 missing=0 skipped=0 state _t _c _a _i
+    while IFS='|' read -r state _t _c _a _i; do
+        case "$state" in ok) ok=$((ok+1));; missing) missing=$((missing+1));; skipped) skipped=$((skipped+1));; esac
+    done < <(survey)
+    jq -n --arg tag "$TAG" --argjson ok "$ok" --argjson missing "$missing" \
+          --argjson skipped "$skipped" --argjson gw "$(gateway_ok && echo true || echo false)" \
+          --arg gwaddr "$GW_ADDR" --arg policy "$POLICY" \
+        '{ok:true,policy:$policy,tag:$tag,rules:{ok:$ok,missing:$missing,skipped:$skipped},
+          gateway:{address:$gwaddr,present:$gw},in_sync:($missing==0 and $gw)}'
+}
+
+case "${1:-}" in
+    check)  cmd_check ;;
+    apply)  cmd_apply ;;
+    show)   cmd_show ;;
+    status) cmd_status ;;
+    *) sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 2 ;;
+esac

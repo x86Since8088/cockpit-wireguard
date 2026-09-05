@@ -413,3 +413,408 @@ pre.wg-rules {
     font-family: var(--wg-mono);
     overflow-wrap: anywhere;
 }
+
+/* =====================================================================
+ * wgclient.js - Clients section (client management, config builder,
+ * routing switches). Appended block; everything here is prefixed .wgc-
+ * so it cannot collide with the read-only view above. Colours come from
+ * the same custom properties, so light/dark needs no extra work.
+ * ===================================================================== */
+
+.wgc { display: block; }
+
+.wgc-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    margin: 0 0 0.6rem;
+    padding-bottom: 0.3rem;
+    border-bottom: 1px solid var(--wg-border-soft);
+}
+.wgc-title { font-size: 1.05rem; font-weight: 600; margin: 0; }
+.wgc-head-spacer { flex: 1 1 auto; }
+
+.wgc-banner:empty { display: none; }
+
+/* ---------- buttons: two extra intents on top of .wg-btn ---------- */
+
+.wg-btn.primary {
+    background: var(--wg-accent);
+    color: var(--wg-bg);
+    border-color: var(--wg-accent);
+}
+.wg-btn.primary:hover { filter: brightness(1.1); background: var(--wg-accent); }
+
+.wg-btn.danger { border-color: var(--wg-bad-border); color: var(--wg-bad-fg); }
+.wg-btn.danger:hover { background: var(--wg-bad-bg); }
+
+.wgc-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
+}
+.wgc-danger { margin-top: 0.9rem; padding-top: 0.6rem; border-top: 1px solid var(--wg-border-soft); }
+.wgc-head-btn { margin-left: auto; }
+
+/* ---------- forms ---------- */
+
+.wgc-form-row { display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; }
+.wgc-field { display: flex; flex-direction: column; gap: 0.15rem; min-width: 12rem; }
+.wgc-field-label { display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.82rem; color: var(--wg-fg-muted); }
+.wgc-field .wg-hint { max-width: 26rem; }
+
+.wgc-input {
+    font: inherit;
+    font-size: 0.85rem;
+    padding: 0.25rem 0.4rem;
+    border: 1px solid var(--wg-border);
+    border-radius: 3px;
+    background: var(--wg-bg);
+    color: var(--wg-fg);
+}
+.wgc-input:focus-visible { outline: 2px solid var(--wg-accent); outline-offset: 1px; }
+.wgc-input:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.wgc-form-error:empty { display: none; }
+.wgc-form-error { margin-top: 0.5rem; }
+
+.wgc-empty-title { margin: 0 0 0.3rem; font-size: 1rem; font-weight: 600; }
+.wgc-empty-card p { margin: 0 0 0.5rem; max-width: 46rem; }
+
+/* ---------- client rows ---------- */
+
+.wgc-client .wgc-ip { color: var(--wg-fg-muted); }
+.wgc-row-actions { display: flex; gap: 0.35rem; }
+.wgc-viewer-row > td { background: var(--wg-card-alt); }
+
+/* ---------- fault panels ---------- */
+
+.wgc-fault-detail { font-size: 0.85rem; max-width: 52rem; }
+.wgc-inline-alert { margin: 0.5rem 0 0; padding: 0.4rem 0.6rem; font-size: 0.82rem; }
+
+/* ---------- config builder ---------- */
+
+.wgc-builder {
+    margin-top: 0.9rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--wg-border-soft);
+}
+.wgc-sub { margin: 0 0 0.5rem; font-size: 0.95rem; font-weight: 600; }
+
+.wgc-presets { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin-top: 0.75rem; }
+.wg-btn.wgc-preset { text-transform: lowercase; font-family: var(--wg-mono); }
+
+.wgc-toggles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
+    gap: 0.3rem;
+    margin: 0.6rem 0 0;
+}
+.wgc-toggle {
+    display: grid;
+    grid-template-columns: auto max-content 1fr;
+    grid-template-areas: "box id cidr" ". desc desc";
+    align-items: center;
+    gap: 0.1rem 0.5rem;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--wg-border-soft);
+    border-radius: 3px;
+    background: var(--wg-card-alt);
+    cursor: pointer;
+}
+.wgc-toggle:hover { border-color: var(--wg-accent); }
+.wgc-toggle input { grid-area: box; margin: 0; }
+.wgc-toggle-id { grid-area: id; font-weight: 600; font-size: 0.85rem; }
+.wgc-toggle-cidr { grid-area: cidr; color: var(--wg-fg-muted); }
+.wgc-toggle-desc { grid-area: desc; font-size: 0.78rem; }
+.wgc-toggle-full { border-color: var(--wg-warn-border); background: var(--wg-warn-bg); }
+
+/* ---------- the two-column explanation ---------- */
+
+.wgc-explain-wrap { margin-top: 0.9rem; }
+.wgc-explain { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+.wgc-explain-col {
+    flex: 1 1 20rem;
+    min-width: 16rem;
+    border: 1px solid var(--wg-border);
+    border-radius: 4px;
+    padding: 0.55rem 0.7rem;
+    background: var(--wg-bg-sunken);
+}
+.wgc-explain-col h4 { margin: 0 0 0.15rem; font-size: 0.88rem; font-weight: 600; }
+.wgc-explain-col .wg-subtle { display: block; font-size: 0.78rem; }
+.wgc-explain-col .wg-empty { padding: 0.4rem 0; }
+
+ul.wgc-cidrs { list-style: none; margin: 0.4rem 0 0; padding: 0; }
+ul.wgc-cidrs li { margin-bottom: 0.15rem; overflow-wrap: anywhere; }
+.wgc-cidr {
+    display: inline-block;
+    padding: 0.02rem 0.35rem;
+    border: 1px solid var(--wg-border);
+    border-radius: 3px;
+    background: var(--wg-card);
+}
+.wgc-asym { max-width: 62rem; margin-top: 0.5rem; }
+
+/* ---------- advanced ---------- */
+
+.wgc-adv { margin-top: 0.9rem; }
+.wgc-adv > summary { cursor: pointer; font-size: 0.85rem; color: var(--wg-fg-muted); }
+.wgc-adv > summary:focus-visible { outline: 2px solid var(--wg-accent); outline-offset: 1px; }
+.wgc-adv-body {
+    margin-top: 0.5rem;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid var(--wg-border-soft);
+    border-radius: 3px;
+    background: var(--wg-bg-sunken);
+}
+
+/* ---------- generated configuration ---------- */
+
+.wgc-viewer { padding: 0.2rem 0 0.4rem; }
+
+.wgc-secret-note {
+    border: 1px solid var(--wg-warn-border);
+    border-left-width: 4px;
+    background: var(--wg-warn-bg);
+    border-radius: 3px;
+    padding: 0.4rem 0.6rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.82rem;
+    max-width: 62rem;
+}
+
+pre.wgc-conf { max-height: 22rem; overflow: auto; }
+
+pre.wgc-qr {
+    margin: 0.6rem 0 0;
+    padding: 0.5rem;
+    background: #ffffff;
+    color: #000000;
+    border: 1px solid var(--wg-border);
+    border-radius: 3px;
+    font-family: var(--wg-mono);
+    font-size: 0.6rem;
+    line-height: 0.6rem;
+    letter-spacing: 0;
+    white-space: pre;
+    overflow-x: auto;
+    display: inline-block;
+}
+
+.wgc-offscreen { position: fixed; top: -1000px; left: -1000px; opacity: 0; }
+
+/* ---------- routing switches ---------- */
+
+.wgc-routing-wrap { margin-top: 1.25rem; }
+.wgc-switches { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.6rem; }
+
+.wgc-switch {
+    border: 1px solid var(--wg-border-soft);
+    border-left: 4px solid var(--wg-bad-border);
+    border-radius: 3px;
+    padding: 0.4rem 0.6rem;
+    background: var(--wg-card-alt);
+}
+.wgc-switch.on { border-left-color: var(--wg-ok-border); }
+.wgc-switch-label { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; flex-wrap: wrap; }
+.wgc-switch-label input { margin: 0; }
+.wgc-switch-name { font-weight: 600; font-size: 0.88rem; }
+.wgc-switch-why { margin-top: 0.2rem; max-width: 62rem; }
+.wgc-switch.ro { border-left-color: var(--wg-border); background: var(--wg-bg-sunken); }
+.wgc-switch-ro { margin-top: 0.2rem; max-width: 62rem; font-style: italic; }
+
+/* =====================================================================
+ * wgclient.js v2 - schema-driven builder, recommendations, IPAM,
+ * client packages. APPEND-ONLY section; everything here is new class
+ * names (still .wgc- prefixed) and touches nothing above. Colours come
+ * from the same custom properties, so light/dark needs no extra work.
+ * ===================================================================== */
+
+/* ---------- schema form: uniform row grid ---------- */
+
+.wgc-sgroup { margin-top: 1rem; }
+.wgc-sgroup-title {
+    margin: 0 0 0.4rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    padding-bottom: 0.2rem;
+    border-bottom: 1px solid var(--wg-border-soft);
+}
+
+.wgc-srow {
+    padding: 0.4rem 0.5rem;
+    border: 1px solid var(--wg-border-soft);
+    border-radius: 3px;
+    background: var(--wg-card-alt);
+    margin-bottom: 0.35rem;
+}
+.wgc-srow-main {
+    display: grid;
+    grid-template-columns: 13rem minmax(0, 1fr) auto;
+    gap: 0.25rem 0.9rem;
+    align-items: center;
+}
+.wgc-srow-label { font-size: 0.85rem; font-weight: 600; }
+.wgc-srow-ctl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+    min-width: 0;
+}
+.wgc-srow-side { display: flex; align-items: center; gap: 0.35rem; white-space: nowrap; }
+.wgc-srow-below { margin-left: 13.9rem; }
+.wgc-srow-below:empty { display: none; }
+.wgc-srow-below .wg-hint { max-width: 46rem; }
+.wgc-srow-err:empty { display: none; }
+.wgc-srow-err { margin-top: 0.25rem; }
+.wgc-srow-err .wg-inline-err { font-family: inherit; }
+
+/* cidr-set spans wide: the grid and explanation need the room */
+.wgc-srow-cidr-set .wgc-srow-main { grid-template-columns: 13rem minmax(0, 1fr); }
+.wgc-srow-cidr-set .wgc-srow-ctl { display: block; }
+.wgc-srow-cidr-set .wgc-srow-below,
+.wgc-srow-toggle .wgc-srow-below { margin-left: 0; }
+
+@media (max-width: 48rem) {
+    .wgc-srow-main { grid-template-columns: 1fr; }
+    .wgc-srow-below { margin-left: 0; }
+}
+
+.wgc-num { width: 7.5rem; }
+.wgc-unit { font-size: 0.8rem; }
+
+.wgc-select {
+    font: inherit;
+    font-size: 0.85rem;
+    padding: 0.25rem 0.4rem;
+    border: 1px solid var(--wg-border);
+    border-radius: 3px;
+    background: var(--wg-bg);
+    color: var(--wg-fg);
+}
+.wgc-select:focus-visible { outline: 2px solid var(--wg-accent); outline-offset: 1px; }
+.wgc-select:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.wgc-toggle-row { display: inline-flex; align-items: center; gap: 0.45rem; cursor: pointer; }
+.wgc-toggle-row input { margin: 0; }
+
+.wgc-radio { display: flex; flex-direction: column; gap: 0.2rem; }
+.wgc-radio-opt {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+.wgc-radio-opt input { margin: 0; }
+
+.wgc-ro-value { overflow-wrap: anywhere; }
+.wgc-secret { letter-spacing: 0.05em; overflow-wrap: anywhere; }
+
+/* ---------- recommendations ---------- */
+
+.wgc-reco-wrap { margin-top: 0.9rem; }
+.wgc-reco-wrap:empty { display: none; }
+.wgc-recos .wgc-reco { margin-top: 0.4rem; }
+.wgc-recos .wgc-reco .wgc-actions { margin-top: 0.4rem; }
+
+/* ---------- the LRU-reuse warning: a banner, never a toast ---------- */
+
+.wgc-banner-warn {
+    border: 2px solid var(--wg-warn-border);
+    border-left-width: 6px;
+    background: var(--wg-warn-bg);
+    color: var(--wg-fg);
+    border-radius: 4px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+}
+.wgc-banner-warn h3 {
+    margin: 0 0 0.3rem;
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--wg-warn-fg);
+}
+.wgc-banner-warn-text { font-size: 0.9rem; max-width: 62rem; }
+
+/* ---------- IPAM panel ---------- */
+
+.wgc-ipam-wrap { margin-top: 1.25rem; }
+.wgc-ipam-summary { margin-bottom: 0.5rem; }
+.wgc-ident { overflow-wrap: anywhere; max-width: 26rem; }
+.wgc-scan {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.9rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid var(--wg-border-soft);
+}
+.wgc-scan-status { font-variant-numeric: tabular-nums; }
+
+/* ---------- client packages ---------- */
+
+.wgc-pkg { padding: 0.2rem 0 0.4rem; }
+
+.wgc-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    margin: 0.5rem 0 0.75rem;
+    border-bottom: 1px solid var(--wg-border);
+}
+.wg-btn.wgc-tab {
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: 3px 3px 0 0;
+    color: var(--wg-fg-muted);
+    background: transparent;
+    padding: 0.3rem 0.9rem;
+}
+.wg-btn.wgc-tab:hover { color: var(--wg-accent); background: var(--wg-info-bg); }
+.wg-btn.wgc-tab.active {
+    color: var(--wg-fg);
+    font-weight: 600;
+    background: var(--wg-card);
+    border-color: var(--wg-border);
+    margin-bottom: -1px;
+    border-bottom: 1px solid var(--wg-card);
+}
+
+.wgc-pkg-h { margin: 0.6rem 0 0.3rem; font-size: 0.9rem; font-weight: 600; }
+.wgc-pkg-steps { margin: 0 0 0.6rem; padding-left: 1.4rem; font-size: 0.88rem; }
+.wgc-pkg-steps li { margin-bottom: 0.2rem; }
+
+.wgc-undo-note {
+    border: 1px solid var(--wg-info-border);
+    border-left-width: 4px;
+    background: var(--wg-info-bg);
+    border-radius: 3px;
+    padding: 0.45rem 0.7rem;
+    margin: 0.5rem 0 0.75rem;
+    font-size: 0.85rem;
+    max-width: 62rem;
+}
+
+.wgc-file {
+    border: 1px solid var(--wg-border);
+    border-radius: 4px;
+    margin-top: 0.6rem;
+    padding: 0.5rem 0.6rem;
+    background: var(--wg-card);
+}
+.wgc-file-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.4rem;
+}
+.wgc-file-name { font-weight: 600; font-size: 0.85rem; }
+.wgc-file-mode { font-size: 0.75rem; color: var(--wg-fg-muted); }
+pre.wgc-file-body { max-height: 20rem; overflow: auto; }

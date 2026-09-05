@@ -1,0 +1,1784 @@
+#!/bin/bash
+#
+# wg-admin-package - per-OS WireGuard client install bundle generator for EDT1.
+#
+# Dispatched from wg-admin as:
+#     wg-admin client-package NAME CFG --os windows|linux|pfsense|opnsense|freebsd
+# wg-admin passes its argv through verbatim, so this executable accepts (and
+# drops) the leading verb word "client-package".
+#
+# Output: exactly one JSON object on stdout, nothing else. Diagnostics go to
+# stderr. Exit 0 = success; on failure {"error": "..."} and a non-zero exit.
+#
+#     { os, files: [ {name, mode, content} ], instructions, undo_note }
+#
+# It READS client state written by wg-admin - never writes it:
+#     /etc/wireguard/clients/NAME/{privatekey,publickey,ip,cfg-CFG.conf}
+# The .conf shipped in the bundle is the stored cfg file (its Endpoint already
+# carries the correct PUBLIC port; it is not recomputed here).
+#
+# THE POINT - the undo contract. WireGuard client installs fail *afterwards*
+# because custom routes/gateway tweaks outlive the tunnel. Every bundle:
+#   - records prior state BEFORE changing anything (undo file, JSON lines
+#     {action, ..., prev}, one line appended per change);
+#   - the down path replays that file in REVERSE - deletes routes it added,
+#     restores settings it changed, then removes the file;
+#   - both directions are idempotent: re-running up neither double-adds nor
+#     double-records, running down twice is clean, a route that is already
+#     gone is not an error, and a route the bundle did not add is NEVER
+#     removed. What wg-quick adds/removes by itself is NOT recorded - it
+#     undoes its own work.
+#
+# SECURITY - non-negotiable (mirrors wg-admin)
+#   The private key appears ONLY inside the .conf content within the emitted
+#   JSON. It is never written to stderr, never logged, never placed in any
+#   process argv (JSON is assembled from the *environment*, because
+#   /proc/<pid>/cmdline is world-readable while environ is owner-only), and
+#   never written to the lint scratch directory (only scripts are linted;
+#   the conf carries no script). Do not add `set -x`.
+#
+# LINT-AT-EMIT: every generated script is syntax-checked before the JSON is
+# emitted - bash scripts with `bash -n`, POSIX sh scripts with `sh -n`, and
+# PowerShell with the real PowerShell parser when pwsh is installed (a stderr
+# note is printed when it is not). A bundle that fails its own linter is
+# refused.
+#
+set -euo pipefail
+shopt -s nullglob
+umask 077
+
+VERSION="1.0.0"
+
+# ---------------------------------------------------------------- constants --
+
+CLIENTS_DIR="/etc/wireguard/clients"
+TUNNEL_CIDR="172.16.0.0/24"
+TUNNEL_PREFIX="172.16.0"
+SERVER_TUN_IP="${TUNNEL_PREFIX}.1"
+ENDPOINT_PLACEHOLDER="<PUBLIC-ENDPOINT>"
+
+DEFAULT_MTU=1420
+DEFAULT_KEEPALIVE=25
+DEFAULT_DNS="8.8.8.8"
+
+# ------------------------------------------------------------------ plumbing --
+
+err() { printf 'wg-admin-package: %s\n' "$*" >&2; }
+
+die() {
+    local msg="$1" code="${2:-1}"
+    err "$msg"
+    if command -v jq >/dev/null 2>&1; then
+        jq -nc --arg error "$msg" '{error: $error}'
+    else
+        printf '{"error":"%s"}\n' "${msg//\"/\'}"
+    fi
+    exit "$code"
+}
+
+need_root() {
+    [[ ${EUID:-$(id -u)} -eq 0 ]] || die "must run as root (invoke via superuser)"
+}
+
+need_tools() {
+    local t
+    for t in "$@"; do
+        command -v "$t" >/dev/null 2>&1 || die "required tool not found: $t"
+    done
+}
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]; }
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: wg-admin-package [client-package] NAME CFG --os OS
+    OS: windows | linux | pfsense | opnsense | freebsd
+
+Emits one JSON object: { os, files:[{name,mode,content}], instructions,
+undo_note }. Reads /etc/wireguard/clients/NAME/cfg-CFG.conf (written by
+wg-admin add-config); never modifies client state.
+USAGE
+}
+
+# --------------------------------------------------------------- bundle state --
+
+NAME="" CFG="" OS=""
+BASE="" BASE_EFF="" IFACE="" CONFFILE=""
+CONF_CONTENT=""
+ENDPOINT="" ENDPOINT_HOST="" ENDPOINT_PORT=""
+ALLOWED="" ALLOWED_SPACED="" ROUTE_LIST=""
+ADDR_IP="" MTU="" DNS="" KEEPALIVE="" SERVER_PUBKEY=""
+INSTRUCTIONS="" UNDO_NOTE=""
+
+FILE_NAMES=() FILE_MODES=() FILE_CONTENTS=() FILE_LINTS=()
+
+add_file() { # add_file NAME MODE CONTENT LINT(bash|sh|ps1|none)
+    local name="$1" mode="$2" content="$3" lint="$4"
+    [[ "$content" == *$'\n' ]] || content+=$'\n'
+    FILE_NAMES+=("$name")
+    FILE_MODES+=("$mode")
+    FILE_CONTENTS+=("$content")
+    FILE_LINTS+=("$lint")
+}
+
+# Substitute @TOKENS@ into a template. All values are validated/derived from
+# wg-admin state whose charsets cannot collide with the token syntax.
+render() {
+    local s="$1"
+    s="${s//@NAME@/$NAME}"
+    s="${s//@CFG@/$CFG}"
+    s="${s//@BASE@/$BASE_EFF}"
+    s="${s//@IFACE@/$IFACE}"
+    s="${s//@CONFFILE@/$CONFFILE}"
+    s="${s//@ENDPOINT@/$ENDPOINT}"
+    s="${s//@ENDPOINT_HOST@/$ENDPOINT_HOST}"
+    s="${s//@ENDPOINT_PORT@/$ENDPOINT_PORT}"
+    s="${s//@ALLOWED@/$ALLOWED}"
+    s="${s//@ALLOWED_SPACED@/$ALLOWED_SPACED}"
+    s="${s//@ROUTE_LIST@/$ROUTE_LIST}"
+    s="${s//@ADDR_IP@/$ADDR_IP}"
+    s="${s//@MTU@/$MTU}"
+    s="${s//@DNS@/$DNS}"
+    s="${s//@KEEPALIVE@/$KEEPALIVE}"
+    s="${s//@SERVER_PUBKEY@/$SERVER_PUBKEY}"
+    s="${s//@SERVER_TUN_IP@/$SERVER_TUN_IP}"
+    s="${s//@TUNNEL_CIDR@/$TUNNEL_CIDR}"
+    printf '%s' "$s"
+}
+
+# Insert PostUp/PreDown hook lines into the [Interface] section of the stored
+# conf (just before the first [Peer]). Used for linux and freebsd; the Windows
+# client does not execute conf scripts, so its recording lives in install.ps1.
+inject_hooks() { # inject_hooks /path/to/wg-undo.sh  (conf on stdin)
+    awk -v undo="$1" '
+        /^\[Peer\]/ && !done {
+            print "# Undo contract: record every extra route/setting change on the way up,"
+            print "# replay them in reverse on the way down. See wg-undo.sh."
+            print "PostUp = " undo " up %i"
+            print "PreDown = " undo " down %i"
+            print ""
+            done = 1
+        }
+        { print }
+    '
+}
+
+conf_field() { # conf_field KEY -> first "Key = value" value in the stored conf
+    sed -n -E "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$/\1/p" \
+        <<<"$CONF_CONTENT" | head -n1
+}
+
+# ---------------------------------------------------------- linux templates --
+
+tpl_linux_undo() {
+cat <<'TPL_LINUX_UNDO'
+#!/bin/bash
+# wg-undo.sh - record/replay undo helper for the @NAME@/@CFG@ WireGuard bundle.
+# Generated by wg-admin-package; works for any interface name.
+#
+# CONTRACT
+#   Before any route or setting is changed, the change is recorded as one JSON
+#   line {action, ..., prev} appended to the undo file. "down"/"replay" walks
+#   that file in REVERSE: routes this helper added are deleted, settings it
+#   changed are restored to their recorded prior values, then the undo file is
+#   removed. Replay is idempotent - running it twice is clean, a route that is
+#   already gone is not an error - and it NEVER removes a route it did not add
+#   (only recorded entries are touched, and deletion uses the full recorded
+#   route spec so an unrelated route to the same prefix survives).
+#   "up"/"add-route"/"set-sysctl" are idempotent too: existing state is
+#   detected and neither re-applied nor re-recorded.
+#
+#   Routes that wg-quick installs by itself (AllowedIPs, policy routing) are
+#   deliberately NOT recorded here: wg-quick removes its own work on the way
+#   down. This helper owns only the EXTRA changes wg-quick does not cover.
+#
+#   DNS: the conf deliberately carries NO "DNS =" line - wg-quick would apply
+#   it via resolvconf(8), a dependency that is missing or dead on minimal
+#   systems and containers, and its failure tears the tunnel down. Instead
+#   the desired server lives in the companion file IFACE.dns (next to the
+#   conf; written by install.sh) and "up" applies it through a LADDER, first
+#   functional method wins, each recorded for undo:
+#     a. resolvectl (daemon reachable): per-interface DNS + "~." routing
+#     b. /etc/resolv.conf writable: record the FULL prior bytes (base64) in
+#        the undo line, then write "nameserver <server>" IN PLACE - never a
+#        rename, because container resolv.conf is often a bind mount
+#     c. neither: print a NOTE and continue
+#   The tunnel outcome is identical in all three cases: UP. A DNS nicety
+#   must never kill a tunnel.
+#
+# This is a bash script; re-exec under bash when started as `sh wg-undo.sh`
+# (dash would die at the first [[).
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+set -eu
+
+STATE_DIR="${WG_UNDO_DIR:-/var/lib/wireguard-undo}"
+IP_BIN="${WG_UNDO_IP:-ip}"
+EXTRA_DIR="${WG_UNDO_EXTRA_DIR:-/etc/wireguard}"
+RESOLV_CONF="${WG_UNDO_RESOLV_CONF:-/etc/resolv.conf}"
+
+err() { printf 'wg-undo: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: wg-undo.sh up IFACE                   apply IFACE.extra-routes and
+                                             IFACE.dns (each change recorded)
+       wg-undo.sh down IFACE                 replay the undo file in reverse
+       wg-undo.sh replay IFACE               same as down
+       wg-undo.sh add-route IFACE CIDR [GW]  add one route, recorded
+       wg-undo.sh set-sysctl IFACE KEY VAL   set a sysctl, prior value recorded
+       wg-undo.sh record IFACE JSON-LINE     append one raw undo line
+Companion files in /etc/wireguard: IFACE.extra-routes ("CIDR" or "CIDR via
+GW" per line) and IFACE.dns (one nameserver IP; applied via resolvectl, else
+an in-place recorded /etc/resolv.conf write, else skipped with a NOTE).
+Undo file: /var/lib/wireguard-undo/IFACE.undo.jsonl. Overrides: WG_UNDO_DIR,
+WG_UNDO_EXTRA_DIR, WG_UNDO_IP (ip(8) command), WG_UNDO_RESOLV_CONF (resolv
+conf path, for tests), WG_UNDO_SKIP_RESOLVECTL=1 (skip the resolvectl rung -
+REQUIRED when calling from a network namespace other than the daemon's,
+because resolvectl resolves the interface name to an index in the caller's
+namespace).
+USAGE
+}
+
+valid_iface() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,15}$ ]]; }
+valid_cidr()  { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]; }
+valid_ip()    { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; }
+
+undo_file() { printf '%s/%s.undo.jsonl' "$STATE_DIR" "$1"; }
+
+# One full line appended per change: O_APPEND single write (atomic for lines
+# this short), serialised with flock when available.
+record_line() {
+    local iface="$1" line="$2" f
+    f="$(undo_file "$iface")"
+    mkdir -p "$STATE_DIR"
+    chmod 0700 "$STATE_DIR" 2>/dev/null || true
+    exec 9>>"$f"
+    if command -v flock >/dev/null 2>&1; then flock -x 9; fi
+    printf '%s\n' "$line" >&9
+    exec 9>&-
+}
+
+json_field() { # json_field LINE KEY -> string value ("" if absent or null)
+    sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" <<<"$1"
+}
+
+# `ip route show PREFIX` matches the exact prefix only.
+route_present() { [[ -n "$($IP_BIN route show "$1" 2>/dev/null)" ]]; }
+
+cmd_add_route() {
+    local iface="$1" cidr="$2" gw="${3:-}"
+    valid_iface "$iface" || die "bad interface: $iface"
+    valid_cidr "$cidr"   || die "bad CIDR: $cidr"
+    if [[ -n "$gw" ]] && ! valid_ip "$gw"; then die "bad gateway: $gw"; fi
+    if route_present "$cidr"; then
+        # Either we already added it (re-run) or it pre-existed. Both mean:
+        # do not touch it, do not record it - so down can never remove a
+        # route this bundle did not add.
+        err "route $cidr already present - not touching it, not recording it"
+        return 0
+    fi
+    if [[ -n "$gw" ]]; then
+        $IP_BIN route add "$cidr" via "$gw" dev "$iface"
+    else
+        $IP_BIN route add "$cidr" dev "$iface"
+    fi
+    record_line "$iface" \
+        "{\"action\":\"route-add\",\"route\":\"$cidr\",\"via\":\"$gw\",\"dev\":\"$iface\",\"prev\":null}"
+    err "added route $cidr (recorded)"
+}
+
+cmd_set_sysctl() {
+    local iface="$1" key="$2" val="$3" prev
+    valid_iface "$iface" || die "bad interface: $iface"
+    [[ "$key" =~ ^[a-z0-9._-]+$ ]]     || die "bad sysctl key: $key"
+    [[ "$val" =~ ^[A-Za-z0-9._-]+$ ]]  || die "bad sysctl value: $val"
+    prev="$(sysctl -n "$key")" || die "cannot read sysctl $key"
+    if [[ "$prev" == "$val" ]]; then
+        err "sysctl $key is already $val - nothing to change, nothing to record"
+        return 0
+    fi
+    record_line "$iface" "{\"action\":\"sysctl\",\"key\":\"$key\",\"prev\":\"$prev\"}"
+    sysctl -qw "$key=$val"
+    err "set sysctl $key=$val (prior value recorded)"
+}
+
+cmd_record() {
+    local iface="$1" line="$2"
+    valid_iface "$iface" || die "bad interface: $iface"
+    [[ "$line" == '{"action":'*'}' ]] || die 'record: line must be a {"action":...} JSON object'
+    case "$line" in *"'"*|*'\'*) die "record: unsupported characters in line" ;; esac
+    record_line "$iface" "$line"
+}
+
+# DNS ladder - first functional method wins, each recorded. NEVER fails the
+# up path: a tunnel must not die because a DNS nicety could not be applied.
+apply_dns() {
+    local iface="$1" f="${EXTRA_DIR}/${iface}.dns" uf server prev_b64
+    uf="$(undo_file "$iface")"
+    if [[ ! -f "$f" ]]; then
+        err "no $f - no DNS override to apply"
+        return 0
+    fi
+    server="$(head -n1 "$f" | tr -d '[:space:]')"
+    if ! valid_ip "$server"; then
+        err "NOTE: DNS not applied: $f does not contain a valid IPv4 address"
+        return 0
+    fi
+    # Idempotence: an existing dns record means a prior up already applied it.
+    if [[ -f "$uf" ]] && grep -q -e '"action":"dns-resolvectl"' -e '"action":"resolv-conf"' "$uf"; then
+        err "DNS already applied and recorded - not re-applying, not re-recording"
+        return 0
+    fi
+    # a. resolvectl, when the daemon is actually reachable (the apply IS the
+    #    probe). Per-interface DNS state dies with the interface, so the undo
+    #    entry is informational; replay reverts when it still can, and logs.
+    #    CAUTION: resolvectl translates the interface NAME to an ifindex in
+    #    the CALLER's network namespace and hands the daemon the bare index -
+    #    called from a foreign netns it would configure whatever host link
+    #    happens to share that index. Normal hook usage runs in the same
+    #    namespace as the daemon; anything else (tests, nested namespaces)
+    #    must set WG_UNDO_SKIP_RESOLVECTL=1 to skip this rung.
+    if [[ -z "${WG_UNDO_SKIP_RESOLVECTL:-}" ]] \
+            && command -v resolvectl >/dev/null 2>&1 \
+            && resolvectl dns "$iface" "$server" 2>/dev/null; then
+        resolvectl domain "$iface" '~.' 2>/dev/null || true
+        record_line "$iface" \
+            "{\"action\":\"dns-resolvectl\",\"iface\":\"$iface\",\"server\":\"$server\",\"prev\":null}"
+        err "DNS $server applied via resolvectl (recorded)"
+        return 0
+    fi
+    # b. Direct write. Record the FULL prior bytes first, then write the new
+    #    content IN PLACE - never rename: container resolv.conf is usually a
+    #    bind mount where rename fails but in-place writes work.
+    if [[ -w "$RESOLV_CONF" ]]; then
+        prev_b64="$(base64 -w0 "$RESOLV_CONF" 2>/dev/null || base64 "$RESOLV_CONF" | tr -d '\n')"
+        record_line "$iface" \
+            "{\"action\":\"resolv-conf\",\"path\":\"$RESOLV_CONF\",\"prev_b64\":\"$prev_b64\",\"prev\":null}"
+        printf 'nameserver %s\n' "$server" > "$RESOLV_CONF"
+        err "DNS $server written to $RESOLV_CONF in place (prior bytes recorded)"
+        return 0
+    fi
+    # c. Nothing workable - say so and carry on. The tunnel stays UP.
+    err "NOTE: DNS not applied: no reachable resolvectl daemon and $RESOLV_CONF is not writable;"
+    err "NOTE: tunnel is up without a DNS override"
+    return 0
+}
+
+cmd_up() {
+    local iface="$1" f line cidr gw
+    valid_iface "$iface" || die "bad interface: $iface"
+    f="${EXTRA_DIR}/${iface}.extra-routes"
+    if [[ ! -f "$f" ]]; then
+        err "no $f - no extra routes to apply"
+    else
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%%#*}"
+            [[ -n "${line//[[:space:]]/}" ]] || continue
+            cidr="$(awk '{print $1}' <<<"$line")"
+            gw="$(awk '$2 == "via" {print $3}' <<<"$line")"
+            cmd_add_route "$iface" "$cidr" "$gw"
+        done < "$f"
+    fi
+    apply_dns "$iface"
+}
+
+cmd_replay() {
+    local iface="$1" f line action cidr via dev key prev prev_b64
+    valid_iface "$iface" || die "bad interface: $iface"
+    f="$(undo_file "$iface")"
+    if [[ ! -f "$f" ]]; then
+        err "no undo file at $f - nothing to replay (already clean)"
+        return 0
+    fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        action="$(json_field "$line" action)"
+        case "$action" in
+        route-add)
+            cidr="$(json_field "$line" route)"
+            via="$(json_field "$line" via)"
+            dev="$(json_field "$line" dev)"
+            if ! valid_cidr "$cidr"; then
+                err "skipping malformed undo line"
+                continue
+            fi
+            if ! route_present "$cidr"; then
+                err "route $cidr already gone - fine"
+                continue
+            fi
+            # Delete with the exact spec we recorded, so an unrelated route
+            # to the same prefix (different gw/dev) is never removed.
+            if [[ -n "$via" ]]; then
+                $IP_BIN route del "$cidr" via "$via" dev "$dev" 2>/dev/null \
+                    || err "route $cidr present but not the one we added - leaving it"
+            else
+                $IP_BIN route del "$cidr" dev "$dev" 2>/dev/null \
+                    || err "route $cidr present but not the one we added - leaving it"
+            fi
+            ;;
+        sysctl)
+            key="$(json_field "$line" key)"
+            prev="$(json_field "$line" prev)"
+            if [[ -n "$key" && -n "$prev" ]]; then
+                if sysctl -qw "$key=$prev"; then
+                    err "restored sysctl $key=$prev"
+                else
+                    err "could not restore sysctl $key - continuing"
+                fi
+            fi
+            ;;
+        dns-resolvectl)
+            # Per-interface resolved state vanishes with the interface, so
+            # there is nothing that CAN outlive the tunnel; revert while the
+            # interface still exists (PreDown), and log either way.
+            if [[ -z "${WG_UNDO_SKIP_RESOLVECTL:-}" ]] \
+                    && command -v resolvectl >/dev/null 2>&1 \
+                    && resolvectl revert "$iface" 2>/dev/null; then
+                err "reverted resolvectl DNS on $iface"
+            else
+                err "dns-resolvectl entry: per-interface DNS dies with the interface - nothing left to restore"
+            fi
+            ;;
+        resolv-conf)
+            prev_b64="$(json_field "$line" prev_b64)"
+            # In-place restore of the exact recorded bytes - never a rename
+            # (bind-mounted resolv.conf). An empty prev_b64 means the file
+            # was empty before: truncate it back.
+            if [[ -z "$prev_b64" ]]; then
+                if : > "$RESOLV_CONF" 2>/dev/null; then
+                    err "restored $RESOLV_CONF (was empty before)"
+                else
+                    err "could not restore $RESOLV_CONF - continuing"
+                fi
+            elif printf '%s' "$prev_b64" | base64 -d > "$RESOLV_CONF" 2>/dev/null; then
+                err "restored $RESOLV_CONF (exact prior bytes)"
+            else
+                err "could not restore $RESOLV_CONF - continuing"
+            fi
+            ;;
+        *)
+            err "unknown undo action '$action' - skipping"
+            ;;
+        esac
+    done < <(tac "$f")
+    rm -f "$f"
+    err "undo complete - $f removed"
+}
+
+case "${1:-}" in
+    up)          [[ $# -eq 2 ]] || { usage; exit 2; }; cmd_up "$2" ;;
+    down|replay) [[ $# -eq 2 ]] || { usage; exit 2; }; cmd_replay "$2" ;;
+    add-route)  [[ $# -eq 3 || $# -eq 4 ]] || { usage; exit 2; }
+                cmd_add_route "$2" "$3" "${4:-}" ;;
+    set-sysctl) [[ $# -eq 4 ]] || { usage; exit 2; }; cmd_set_sysctl "$2" "$3" "$4" ;;
+    record)     [[ $# -eq 3 ]] || { usage; exit 2; }; cmd_record "$2" "$3" ;;
+    -h|--help)  usage; exit 0 ;;
+    *)          usage; exit 2 ;;
+esac
+TPL_LINUX_UNDO
+}
+
+tpl_linux_install() {
+cat <<'TPL_LINUX_INSTALL'
+#!/bin/bash
+# install.sh - install (do NOT activate) the WireGuard client tunnel
+# "@IFACE@" on this Linux box. Generated by wg-admin-package for @NAME@/@CFG@.
+# Idempotent: safe to re-run.
+#
+# Install and activation are separate steps by design. This script must work
+# in contexts WITHOUT NET_ADMIN - image builds, provisioning pipelines,
+# config management - and an installer that dials the endpoint as a side
+# effect would be wrong even with privileges. It installs packages, places
+# files, validates the conf statically, and only PRINTS the activation
+# commands.
+#
+# This is a bash script; re-exec under bash when started as `sh install.sh`
+# (dash would die at the first [[).
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+set -eu
+umask 077
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "run as root" >&2; exit 1; }
+
+SRC="$(cd "$(dirname "$0")" && pwd)"
+IFACE="@IFACE@"
+CONF="@CONFFILE@"
+
+# 1. wireguard-tools via whichever package manager this distro has.
+#    (--no-install-recommends keeps apt from dragging in dkms module builds
+#    that fail inside containers; wg + wg-quick need nothing beyond libc.)
+if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
+    echo "wireguard-tools already installed"
+elif command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq || true
+    apt-get install -y --no-install-recommends wireguard-tools
+elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y wireguard-tools
+elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm --needed wireguard-tools
+else
+    echo "no apt/dnf/pacman found - install wireguard-tools manually, then re-run" >&2
+    exit 1
+fi
+
+# 2. Config + undo helper. The conf's PostUp/PreDown call wg-undo.sh, which
+#    records every extra route/setting change BEFORE making it and replays
+#    the record in reverse on the way down, so nothing outlives the tunnel.
+#
+#    The conf deliberately carries NO "DNS =" line: wg-quick would apply it
+#    through resolvconf(8), which is missing or not running on minimal
+#    systems and containers, and its failure kills the whole tunnel. The
+#    desired server goes in the ${IFACE}.dns companion file instead;
+#    wg-undo.sh applies it at PostUp via a fallback ladder (resolvectl ->
+#    recorded in-place /etc/resolv.conf write -> skip with a NOTE) and the
+#    tunnel comes up in every case.
+install -d -m 0700 /etc/wireguard
+install -m 0755 "$SRC/wg-undo.sh" /etc/wireguard/wg-undo.sh
+install -m 0600 "$SRC/$CONF" "/etc/wireguard/${IFACE}.conf"
+printf '%s\n' "@DNS@" > "/etc/wireguard/${IFACE}.dns"
+chmod 0644 "/etc/wireguard/${IFACE}.dns"
+
+# 3. Static validation - parses the conf without touching the network.
+#    stdout is discarded: `wg-quick strip` prints the config INCLUDING the
+#    private key, which must never reach a terminal or log.
+if wg-quick strip "/etc/wireguard/${IFACE}.conf" >/dev/null; then
+    echo "config validated: /etc/wireguard/${IFACE}.conf parses cleanly"
+else
+    echo "config validation FAILED - not activating instructions for a broken conf" >&2
+    exit 1
+fi
+
+# 4. Optional capability probe with a THROWAWAY interface name - never the
+#    real interface, never the real conf. Lack of permission is a NOTE, not
+#    an error: image builds and provisioning pipelines have no NET_ADMIN.
+if command -v ip >/dev/null 2>&1 && ip link add wgselftest0 type wireguard 2>/dev/null; then
+    ip link del wgselftest0 2>/dev/null || true
+    echo "capability probe: kernel WireGuard + NET_ADMIN available here"
+else
+    echo "NOTE: cannot create WireGuard interfaces in this context (no NET_ADMIN,"
+    echo "NOTE: or no kernel module). Expected in image builds and provisioning -"
+    echo "NOTE: activate later on the running system."
+fi
+
+# 5. Installed. Activation is a separate, deliberate step:
+echo "install complete. To activate the tunnel:"
+if [[ -d /run/systemd/system ]]; then
+    echo "    systemctl enable --now wg-quick@${IFACE}"
+else
+    echo "    wg-quick up ${IFACE}"
+fi
+echo "then verify: wg show ${IFACE}   (expect a recent handshake), then ping @SERVER_TUN_IP@"
+TPL_LINUX_INSTALL
+}
+
+tpl_linux_uninstall() {
+cat <<'TPL_LINUX_UNINSTALL'
+#!/bin/bash
+# uninstall.sh - remove the WireGuard client tunnel "@IFACE@" and undo every
+# route/setting change this bundle made. Idempotent: safe to run twice.
+#
+# This is a bash script; re-exec under bash when started as `sh uninstall.sh`
+# (dash would die at the first [[).
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+set -eu
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "run as root" >&2; exit 1; }
+IFACE="@IFACE@"
+
+# 1. Down the tunnel. PreDown runs 'wg-undo.sh down', which replays the undo
+#    file in reverse; wg-quick then removes its own routes itself.
+if [[ -d /run/systemd/system ]]; then
+    systemctl disable --now "wg-quick@${IFACE}" 2>/dev/null || true
+elif ip link show "$IFACE" >/dev/null 2>&1; then
+    wg-quick down "/etc/wireguard/${IFACE}.conf" || true
+fi
+
+# 2. Safety net: replay any undo data the down path did not consume
+#    (a no-op when the file is already gone).
+if [[ -x /etc/wireguard/wg-undo.sh ]]; then
+    /etc/wireguard/wg-undo.sh replay "$IFACE" || true
+fi
+
+# 3. Our files. wg-undo.sh stays while any other conf still references it.
+rm -f "/etc/wireguard/${IFACE}.conf" "/etc/wireguard/${IFACE}.extra-routes" \
+      "/etc/wireguard/${IFACE}.dns"
+if ! grep -qs 'wg-undo\.sh' /etc/wireguard/*.conf 2>/dev/null; then
+    rm -f /etc/wireguard/wg-undo.sh
+fi
+
+echo "tunnel ${IFACE} removed; routes and settings restored"
+echo "(the wireguard-tools package is left installed)"
+TPL_LINUX_UNINSTALL
+}
+
+# -------------------------------------------------------- windows templates --
+
+tpl_win_install() {
+cat <<'TPL_WIN_INSTALL'
+# install.ps1 - install WireGuard and the "@BASE@" tunnel on Windows.
+# Generated by wg-admin-package for @NAME@/@CFG@. PowerShell 5.1 compatible.
+# Idempotent: safe to re-run.
+#
+# UNDO CONTRACT: the Windows WireGuard client does not run PostUp/PreDown
+# scripts by default, so the recording happens here instead. The IPv4 route
+# table is snapshotted BEFORE the tunnel service is installed and again after
+# it is up; every route that APPEARED is recorded as one JSON line
+# ({action, ..., prev}) in the undo file. down.ps1 replays that file in
+# reverse and deletes only what is recorded there - so no route this bundle
+# added can outlive the tunnel, and no route it did not add is ever touched.
+
+$ErrorActionPreference = 'Stop'
+$TunnelName = '@BASE@'
+$ConfFile   = Join-Path $PSScriptRoot '@CONFFILE@'
+$UndoDir    = Join-Path $env:ProgramData 'WireGuardUndo'
+$UndoFile   = Join-Path $UndoDir ($TunnelName + '.undo.jsonl')
+$WgExe      = Join-Path $env:ProgramFiles 'WireGuard\wireguard.exe'
+
+$identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Run this script from an elevated (Administrator) PowerShell.'
+}
+if (-not (Test-Path $ConfFile)) { throw ('config file not found: ' + $ConfFile) }
+
+# --- 1. WireGuard itself ----------------------------------------------------
+if (Test-Path $WgExe) {
+    Write-Host 'WireGuard already installed'
+} else {
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host 'installing WireGuard via winget...'
+        winget install --id WireGuard.WireGuard -e --silent --accept-package-agreements --accept-source-agreements
+    } else {
+        # Fallback: the official MSI. VERIFY THE CHECKSUM: compare the SHA256
+        # printed below against the file listing published at
+        # https://download.wireguard.com/windows-client/ before trusting it.
+        $msiUrl = 'https://download.wireguard.com/windows-client/wireguard-amd64-0.5.3.msi'
+        $msi    = Join-Path $env:TEMP 'wireguard-amd64-0.5.3.msi'
+        Write-Host ('winget not available - downloading ' + $msiUrl)
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing
+        $hash = (Get-FileHash -Algorithm SHA256 -Path $msi).Hash
+        Write-Host ('downloaded MSI SHA256: ' + $hash)
+        Write-Host 'compare it against https://download.wireguard.com/windows-client/ before continuing'
+        Start-Process msiexec.exe -ArgumentList '/i', ('"' + $msi + '"'), '/qn', 'DO_NOT_LAUNCH=1' -Wait
+    }
+    if (-not (Test-Path $WgExe)) { throw 'WireGuard installation did not produce wireguard.exe' }
+}
+
+# --- 2. Idempotence: an existing tunnel service means nothing left to do ----
+$svcName = 'WireGuardTunnel$' + $TunnelName
+$svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+if ($svc) {
+    Write-Host ('tunnel service ' + $svcName + ' already installed (' + $svc.Status + ') - not re-adding, not re-recording')
+    exit 0
+}
+
+# --- 3. Snapshot the route table BEFORE changing anything -------------------
+$before = @{}
+Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
+    $before[($_.DestinationPrefix + '|' + $_.InterfaceAlias + '|' + $_.NextHop)] = $true
+}
+
+# --- 4. Install the tunnel as a Windows service -----------------------------
+& $WgExe /installtunnelservice $ConfFile
+$deadline = (Get-Date).AddSeconds(30)
+do {
+    Start-Sleep -Seconds 1
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+} until (($svc -and $svc.Status -eq 'Running') -or ((Get-Date) -gt $deadline))
+if ((-not $svc) -or ($svc.Status -ne 'Running')) {
+    Write-Warning 'tunnel service is not Running yet - route recording may be incomplete; re-run this script once it connects'
+}
+Start-Sleep -Seconds 3
+
+# --- 5. Snapshot AFTER; record the diff, one JSON line per added route ------
+if (-not (Test-Path $UndoDir)) { New-Item -ItemType Directory -Path $UndoDir -Force | Out-Null }
+$existing = ''
+if (Test-Path $UndoFile) {
+    $existing = [string](Get-Content $UndoFile -Raw -ErrorAction SilentlyContinue)
+}
+$added = 0
+Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
+    $key = ($_.DestinationPrefix + '|' + $_.InterfaceAlias + '|' + $_.NextHop)
+    if ($before.ContainsKey($key)) { return }          # pre-existing: never ours
+    $needle = '"destination":"' + $_.DestinationPrefix + '"'
+    if ($existing -and $existing.Contains($needle)) { return }  # already recorded
+    $entry = New-Object PSObject -Property @{
+        action      = 'route-add'
+        destination = $_.DestinationPrefix
+        interface   = $_.InterfaceAlias
+        nexthop     = $_.NextHop
+        prev        = $null
+    }
+    Add-Content -Path $UndoFile -Value ($entry | ConvertTo-Json -Compress)
+    $added = $added + 1
+}
+Write-Host ('recorded ' + $added + ' route change(s) to ' + $UndoFile)
+Write-Host ('tunnel "' + $TunnelName + '" installed as service ' + $svcName)
+Write-Host 'verify: open the WireGuard app (expect a recent handshake), then: ping @SERVER_TUN_IP@'
+TPL_WIN_INSTALL
+}
+
+tpl_win_down() {
+cat <<'TPL_WIN_DOWN'
+# down.ps1 - stop and remove the "@BASE@" tunnel service, then replay the undo
+# file in REVERSE: only routes recorded there are deleted (a route already
+# gone is fine), then the file is removed. Idempotent: safe to run twice, and
+# it never deletes a route it did not record. PowerShell 5.1 compatible.
+
+$ErrorActionPreference = 'Stop'
+$TunnelName = '@BASE@'
+$UndoDir  = Join-Path $env:ProgramData 'WireGuardUndo'
+$UndoFile = Join-Path $UndoDir ($TunnelName + '.undo.jsonl')
+$WgExe    = Join-Path $env:ProgramFiles 'WireGuard\wireguard.exe'
+
+$identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Run this script from an elevated (Administrator) PowerShell.'
+}
+
+$svcName = 'WireGuardTunnel$' + $TunnelName
+$svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+if ($svc) {
+    Write-Host ('removing tunnel service ' + $svcName)
+    & $WgExe /uninstalltunnelservice $TunnelName
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        Start-Sleep -Seconds 1
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    } until ((-not $svc) -or ((Get-Date) -gt $deadline))
+} else {
+    Write-Host 'tunnel service already removed'
+}
+
+if (Test-Path $UndoFile) {
+    $lines = @(Get-Content $UndoFile | Where-Object { $_ -match '\S' })
+    [array]::Reverse($lines)
+    foreach ($line in $lines) {
+        $e = $null
+        try { $e = $line | ConvertFrom-Json } catch {
+            Write-Warning ('skipping malformed undo line: ' + $line)
+            continue
+        }
+        if ($e.action -ne 'route-add') {
+            Write-Warning ('unknown undo action "' + $e.action + '" - skipping')
+            continue
+        }
+        $r = Get-NetRoute -DestinationPrefix $e.destination -ErrorAction SilentlyContinue |
+             Where-Object { $_.InterfaceAlias -eq $e.interface }
+        if ($r) {
+            $r | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host ('removed leftover route ' + $e.destination + ' (' + $e.interface + ')')
+        } else {
+            Write-Host ('route ' + $e.destination + ' already gone - fine')
+        }
+    }
+    Remove-Item $UndoFile -Force
+    Write-Host ('undo complete - ' + $UndoFile + ' removed')
+} else {
+    Write-Host 'no undo file - nothing to replay (already clean)'
+}
+TPL_WIN_DOWN
+}
+
+tpl_win_uninstall() {
+cat <<'TPL_WIN_UNINSTALL'
+# uninstall.ps1 - full removal of the "@BASE@" tunnel: runs down.ps1 (service
+# removal + undo replay), then tidies the undo directory. The WireGuard
+# application itself is left installed - remove it with
+# "winget uninstall WireGuard.WireGuard" or Apps & Features if no other
+# tunnels use it. PowerShell 5.1 compatible; idempotent.
+
+$ErrorActionPreference = 'Stop'
+& (Join-Path $PSScriptRoot 'down.ps1')
+
+$UndoDir = Join-Path $env:ProgramData 'WireGuardUndo'
+if ((Test-Path $UndoDir) -and (@(Get-ChildItem $UndoDir).Count -eq 0)) {
+    Remove-Item $UndoDir -Force
+}
+Write-Host 'uninstall complete'
+TPL_WIN_UNINSTALL
+}
+
+# -------------------------------------------------------- freebsd templates --
+
+tpl_bsd_undo() {
+cat <<'TPL_BSD_UNDO'
+#!/bin/sh
+# wg-undo.sh - record/replay undo helper for the @NAME@/@CFG@ WireGuard bundle
+# on FreeBSD. Generated by wg-admin-package. POSIX sh.
+#
+# CONTRACT
+#   Before any route or rc.conf key is changed, the change is recorded as one
+#   JSON line {action, ..., prev} appended to an undo file:
+#     runtime  (route(8) adds):  /var/db/wireguard-undo/IFACE.undo.jsonl
+#     install  (rc.conf keys):   /var/db/wireguard-undo/IFACE.install.jsonl
+#   "down"/"replay" walk the runtime file in REVERSE, delete only the routes
+#   recorded there (already-gone is fine, and deletion carries the recorded
+#   interface/gateway so an unrelated route to the same prefix survives),
+#   then remove the file. "replay-install" restores every rc.conf key to its
+#   recorded prior value - prev:null means the key did not exist and is
+#   deleted again with sysrc -x. All verbs are idempotent: re-running up
+#   neither double-adds nor double-records; replaying twice is clean.
+#   Routes wg-quick adds by itself are NOT recorded - it undoes its own work.
+set -eu
+
+STATE_DIR="${WG_UNDO_DIR:-/var/db/wireguard-undo}"
+CONF_DIR="${WG_UNDO_CONF_DIR:-/usr/local/etc/wireguard}"
+
+err() { printf 'wg-undo: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: wg-undo.sh up IFACE                   apply IFACE.extra-routes (recorded)
+       wg-undo.sh down IFACE                 replay runtime undo in reverse
+       wg-undo.sh replay IFACE               same as down
+       wg-undo.sh replay-install IFACE       restore recorded rc.conf keys
+       wg-undo.sh add-route IFACE CIDR [GW]  add one route, recorded
+       wg-undo.sh sysrc-set IFACE KEY VALUE  set an rc.conf key, prior recorded
+       wg-undo.sh record IFACE JSON-LINE     append one raw undo line
+USAGE
+}
+
+valid_iface() { case "$1" in ""|*[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
+valid_cidr()  {
+    case "$1" in ""|*[!0-9./]*) return 1 ;; */*) : ;; *) return 1 ;; esac
+    return 0
+}
+valid_word()  { case "$1" in ""|*[!A-Za-z0-9._:/-]*) return 1 ;; esac; return 0; }
+
+undo_file()    { printf '%s/%s.undo.jsonl' "$STATE_DIR" "$1"; }
+install_file() { printf '%s/%s.install.jsonl' "$STATE_DIR" "$1"; }
+
+record_line() { # record_line FILE LINE - one full line appended per change
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+    printf '%s\n' "$2" >> "$1"
+}
+
+json_str() { # json_str LINE KEY -> value of "KEY":"value" ("" if absent/null)
+    printf '%s\n' "$1" | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p"
+}
+
+reverse_lines() {
+    if tail -r </dev/null >/dev/null 2>&1; then
+        tail -r
+    elif command -v tac >/dev/null 2>&1; then
+        tac
+    else
+        sed -n '1!G;h;$p'
+    fi
+}
+
+route_present() {
+    netstat -rn -f inet | awk -v d="$1" '$1 == d { found = 1 } END { exit !found }'
+}
+
+cmd_add_route() {
+    iface="$1"; cidr="$2"; gw="${3:-}"
+    valid_iface "$iface" || die "bad interface: $iface"
+    valid_cidr "$cidr"   || die "bad CIDR: $cidr"
+    if [ -n "$gw" ] && ! valid_word "$gw"; then die "bad gateway: $gw"; fi
+    if route_present "$cidr"; then
+        err "route $cidr already present - not touching it, not recording it"
+        return 0
+    fi
+    if [ -n "$gw" ]; then
+        route -q add -net "$cidr" "$gw"
+    else
+        route -q add -net "$cidr" -interface "$iface"
+    fi
+    record_line "$(undo_file "$iface")" \
+        "{\"action\":\"route-add\",\"route\":\"$cidr\",\"via\":\"$gw\",\"dev\":\"$iface\",\"prev\":null}"
+    err "added route $cidr (recorded)"
+}
+
+cmd_sysrc_set() {
+    iface="$1"; key="$2"; val="$3"
+    valid_iface "$iface" || die "bad interface: $iface"
+    case "$key" in ""|*[!A-Za-z0-9_]*) die "bad rc.conf key: $key" ;; esac
+    f="$(install_file "$iface")"
+    had=0; cur=""
+    if sysrc -n "$key" >/dev/null 2>&1; then
+        had=1
+        cur="$(sysrc -n "$key")"
+    fi
+    if [ "$had" -eq 1 ] && [ "$cur" = "$val" ]; then
+        err "rc.conf $key already '$val' - nothing to change, nothing to record"
+        return 0
+    fi
+    # Record the ORIGINAL value exactly once: a re-run must never overwrite
+    # the true prior state with a value we set ourselves.
+    if [ -f "$f" ] && grep -q "\"key\":\"$key\"" "$f" 2>/dev/null; then
+        err "rc.conf $key prior state already recorded - not re-recording"
+    elif [ "$had" -eq 1 ]; then
+        safe="$(printf '%s' "$cur" | tr -d '"\\')"
+        record_line "$f" "{\"action\":\"sysrc\",\"key\":\"$key\",\"prev\":\"$safe\"}"
+    else
+        record_line "$f" "{\"action\":\"sysrc\",\"key\":\"$key\",\"prev\":null}"
+    fi
+    sysrc "$key=$val" >/dev/null
+    err "set rc.conf $key=$val (prior state recorded)"
+}
+
+cmd_record() {
+    iface="$1"; line="$2"
+    valid_iface "$iface" || die "bad interface: $iface"
+    case "$line" in
+    '{"action":'*'}') : ;;
+    *) die 'record: line must be a {"action":...} JSON object' ;;
+    esac
+    case "$line" in *"'"*) die "record: unsupported characters in line" ;; esac
+    record_line "$(undo_file "$iface")" "$line"
+}
+
+cmd_up() {
+    iface="$1"
+    valid_iface "$iface" || die "bad interface: $iface"
+    f="${CONF_DIR}/${iface}.extra-routes"
+    if [ ! -f "$f" ]; then
+        err "no $f - no extra routes to apply"
+        return 0
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        # shellcheck disable=SC2086
+        set -- $line
+        [ $# -ge 1 ] || continue
+        cidr="$1"; gw=""
+        if [ $# -ge 3 ] && [ "$2" = "via" ]; then gw="$3"; fi
+        cmd_add_route "$iface" "$cidr" "$gw"
+    done < "$f"
+}
+
+replay_file() {
+    f="$1"
+    if [ ! -f "$f" ]; then
+        err "no undo file at $f - nothing to replay (already clean)"
+        return 0
+    fi
+    tmp="${f}.replay.$$"
+    reverse_lines < "$f" > "$tmp"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        action="$(json_str "$line" action)"
+        case "$action" in
+        route-add)
+            cidr="$(json_str "$line" route)"
+            gw="$(json_str "$line" via)"
+            dev="$(json_str "$line" dev)"
+            if ! valid_cidr "$cidr"; then
+                err "skipping malformed undo line"
+                continue
+            fi
+            if ! route_present "$cidr"; then
+                err "route $cidr already gone - fine"
+                continue
+            fi
+            # Delete with the recorded spec so an unrelated route to the
+            # same prefix (other gateway/interface) is never removed.
+            if [ -n "$gw" ]; then
+                route -q delete -net "$cidr" "$gw" \
+                    || err "route $cidr present but not the one we added - leaving it"
+            else
+                route -q delete -net "$cidr" -interface "$dev" \
+                    || err "route $cidr present but not the one we added - leaving it"
+            fi
+            ;;
+        sysrc)
+            key="$(json_str "$line" key)"
+            case "$line" in
+            *'"prev":null'*)
+                sysrc -x "$key" 2>/dev/null || true
+                err "removed rc.conf $key (it did not exist before)"
+                ;;
+            *)
+                prev="$(json_str "$line" prev)"
+                sysrc "$key=$prev" >/dev/null
+                err "restored rc.conf $key=$prev"
+                ;;
+            esac
+            ;;
+        *)
+            err "unknown undo action '$action' - skipping"
+            ;;
+        esac
+    done < "$tmp"
+    rm -f "$tmp" "$f"
+    err "undo complete - $f removed"
+}
+
+case "${1:-}" in
+    up)             [ $# -eq 2 ] || { usage; exit 2; }; cmd_up "$2" ;;
+    down|replay)    [ $# -eq 2 ] || { usage; exit 2; }
+                    valid_iface "$2" || die "bad interface: $2"
+                    replay_file "$(undo_file "$2")" ;;
+    replay-install) [ $# -eq 2 ] || { usage; exit 2; }
+                    valid_iface "$2" || die "bad interface: $2"
+                    replay_file "$(install_file "$2")" ;;
+    add-route)      [ $# -eq 3 ] || [ $# -eq 4 ] || { usage; exit 2; }
+                    cmd_add_route "$2" "$3" "${4:-}" ;;
+    sysrc-set)      [ $# -eq 4 ] || { usage; exit 2; }; cmd_sysrc_set "$2" "$3" "$4" ;;
+    record)         [ $# -eq 3 ] || { usage; exit 2; }; cmd_record "$2" "$3" ;;
+    -h|--help)      usage; exit 0 ;;
+    *)              usage; exit 2 ;;
+esac
+TPL_BSD_UNDO
+}
+
+tpl_bsd_install() {
+cat <<'TPL_BSD_INSTALL'
+#!/bin/sh
+# install.sh - install the WireGuard client tunnel "@IFACE@" on FreeBSD.
+# Generated by wg-admin-package for @NAME@/@CFG@. POSIX sh; idempotent.
+# rc.conf keys are changed ONLY through wg-undo.sh sysrc-set, which captures
+# each key's prior value (or its absence) FIRST, so uninstall can put rc.conf
+# back exactly as it was - including deleting keys that did not exist.
+set -eu
+umask 077
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
+
+SRC="$(cd "$(dirname "$0")" && pwd)"
+IFACE="@IFACE@"
+CONF="@CONFFILE@"
+WGDIR="/usr/local/etc/wireguard"
+UNDO="$WGDIR/wg-undo.sh"
+
+# 1. Package (idempotent).
+if pkg info -e wireguard-tools >/dev/null 2>&1; then
+    echo "wireguard-tools already installed"
+else
+    pkg install -y wireguard-tools
+fi
+
+# 2. Files.
+install -d -m 700 "$WGDIR"
+install -m 755 "$SRC/wg-undo.sh" "$UNDO"
+install -m 600 "$SRC/$CONF" "$WGDIR/$IFACE.conf"
+
+# 3. rc.conf - prior values are recorded to the install undo file first.
+"$UNDO" sysrc-set "$IFACE" wireguard_enable YES
+cur=""
+if sysrc -n wireguard_interfaces >/dev/null 2>&1; then
+    cur="$(sysrc -n wireguard_interfaces)"
+fi
+case " $cur " in
+*" $IFACE "*)
+    echo "rc.conf wireguard_interfaces already lists $IFACE"
+    ;;
+*)
+    if [ -n "$cur" ]; then
+        "$UNDO" sysrc-set "$IFACE" wireguard_interfaces "$cur $IFACE"
+    else
+        "$UNDO" sysrc-set "$IFACE" wireguard_interfaces "$IFACE"
+    fi
+    ;;
+esac
+
+# 4. Bring the tunnel up.
+if command -v wg-quick >/dev/null 2>&1; then
+    if wg show "$IFACE" >/dev/null 2>&1; then
+        echo "tunnel $IFACE already up"
+    else
+        wg-quick up "$IFACE"
+    fi
+else
+    # Manual path (no wg-quick): create the interface, load a stripped conf,
+    # then add each destination route THROUGH wg-undo.sh so every route is
+    # recorded and the down path can put the routing table back.
+    if ! ifconfig "$IFACE" >/dev/null 2>&1; then
+        ifconfig wg create name "$IFACE" >/dev/null
+    fi
+    tmp="$(mktemp)" || exit 1
+    sed -e '/^[ 	]*Address[ 	]*=/d'  -e '/^[ 	]*DNS[ 	]*=/d' \
+        -e '/^[ 	]*MTU[ 	]*=/d'      -e '/^[ 	]*Post[UD][a-z]*[ 	]*=/d' \
+        -e '/^[ 	]*Pre[UD][a-z]*[ 	]*=/d' \
+        "$WGDIR/$IFACE.conf" > "$tmp"
+    wg setconf "$IFACE" "$tmp"
+    rm -f "$tmp"
+    ifconfig "$IFACE" inet @ADDR_IP@/32 @SERVER_TUN_IP@ alias
+    ifconfig "$IFACE" mtu @MTU@ up
+    for cidr in @ALLOWED_SPACED@; do
+        if [ "$cidr" = "0.0.0.0/0" ]; then
+            echo "full-tunnel config: set the default route manually and deliberately" >&2
+            continue
+        fi
+        "$UNDO" add-route "$IFACE" "$cidr"
+    done
+fi
+
+echo "verify: wg show $IFACE   (expect a recent handshake), then ping @SERVER_TUN_IP@"
+TPL_BSD_INSTALL
+}
+
+tpl_bsd_uninstall() {
+cat <<'TPL_BSD_UNINSTALL'
+#!/bin/sh
+# uninstall.sh - remove the WireGuard client tunnel "@IFACE@" from FreeBSD and
+# restore routes and rc.conf to their recorded prior state. POSIX sh;
+# idempotent: safe to run twice.
+set -eu
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
+IFACE="@IFACE@"
+WGDIR="/usr/local/etc/wireguard"
+UNDO="$WGDIR/wg-undo.sh"
+
+# 1. Tunnel down. The wg-quick path runs PreDown -> undo replay by itself.
+if command -v wg-quick >/dev/null 2>&1 && wg show "$IFACE" >/dev/null 2>&1; then
+    wg-quick down "$IFACE" || true
+fi
+if ifconfig "$IFACE" >/dev/null 2>&1; then
+    ifconfig "$IFACE" destroy || true
+fi
+
+# 2. Replay whatever undo data is left: runtime route changes first, then the
+#    install-time rc.conf keys (prev:null keys are deleted with sysrc -x -
+#    they did not exist before this bundle).
+if [ -x "$UNDO" ]; then
+    "$UNDO" replay "$IFACE" || true
+    "$UNDO" replay-install "$IFACE" || true
+fi
+
+# 3. Our files. wg-undo.sh stays while any other conf still references it.
+rm -f "$WGDIR/$IFACE.conf" "$WGDIR/$IFACE.extra-routes"
+if ! grep -qs 'wg-undo\.sh' "$WGDIR"/*.conf 2>/dev/null; then
+    rm -f "$UNDO"
+fi
+
+echo "tunnel $IFACE removed; routes and rc.conf restored"
+echo "(the wireguard-tools package is left installed)"
+TPL_BSD_UNINSTALL
+}
+
+# ------------------------------------------------- pfsense/opnsense verify --
+
+tpl_verify() {
+cat <<'TPL_VERIFY'
+#!/bin/sh
+# verify.sh - READ-ONLY health check for the @NAME@/@CFG@ WireGuard tunnel on
+# pfSense/OPNsense. It persists NOTHING: on these platforms config.xml owns
+# routing and interfaces, so this script only inspects and reports. POSIX sh.
+set -u
+
+SERVER_PUB="@SERVER_PUBKEY@"
+SERVER_TUN_IP="@SERVER_TUN_IP@"
+ROUTES="@ALLOWED_SPACED@"
+
+pass=0
+fail=0
+ok()  { printf 'PASS  %s\n' "$*"; pass=$((pass+1)); }
+bad() { printf 'FAIL  %s\n' "$*"; fail=$((fail+1)); }
+
+# 1. Find the wg interface whose peer is the EDT1 server.
+IFACE=""
+for i in $(wg show interfaces 2>/dev/null); do
+    if wg show "$i" peers 2>/dev/null | grep -qxF "$SERVER_PUB"; then
+        IFACE="$i"
+        break
+    fi
+done
+if [ -n "$IFACE" ]; then
+    ok "tunnel interface found: $IFACE (peer matches the server key)"
+else
+    bad "no WireGuard interface carries the server peer - tunnel not configured yet?"
+fi
+
+# 2. Handshake freshness (a healthy tunnel re-handshakes at least every ~3 min).
+if [ -n "$IFACE" ]; then
+    hs="$(wg show "$IFACE" latest-handshakes 2>/dev/null \
+          | awk -v k="$SERVER_PUB" '$1 == k { print $2 }')"
+    now="$(date +%s)"
+    if [ -n "${hs:-}" ] && [ "$hs" -gt 0 ] 2>/dev/null && [ $((now - hs)) -lt 190 ]; then
+        ok "handshake $((now - hs))s ago"
+    else
+        bad "no recent handshake (endpoint @ENDPOINT@ unreachable, or keys/port wrong)"
+    fi
+fi
+
+# 3. A route must exist for every destination this config should reach.
+for r in $ROUTES; do
+    if netstat -rn -f inet | awk -v d="$r" '$1 == d { found = 1 } END { exit !found }'; then
+        ok "route present: $r"
+    else
+        bad "route MISSING: $r  (create the gateway + static route in the GUI - see instructions)"
+    fi
+done
+
+# 4. Reachability of the server's tunnel address.
+if ping -c 2 -t 3 "$SERVER_TUN_IP" >/dev/null 2>&1; then
+    ok "server tunnel address $SERVER_TUN_IP answers ping"
+else
+    bad "cannot ping $SERVER_TUN_IP through the tunnel"
+fi
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
+TPL_VERIFY
+}
+
+# ------------------------------------------------------- instruction blocks --
+
+instr_linux() {
+cat <<'TPL_I_LINUX'
+WireGuard client bundle for @NAME@ (config: @CFG@) - Linux
+
+Files: @CONFFILE@ (tunnel config), install.sh, wg-undo.sh, uninstall.sh.
+
+1. Copy all four files into one directory on the target machine.
+2. Install: sudo ./install.sh   (sh install.sh also works - it re-execs bash)
+   - installs wireguard-tools via apt/dnf/pacman (skipped when present)
+   - installs the config as /etc/wireguard/@IFACE@.conf (0600), the undo
+     helper as /etc/wireguard/wg-undo.sh, and the DNS companion file
+     /etc/wireguard/@IFACE@.dns (containing @DNS@)
+   - the conf deliberately carries NO "DNS =" line: wg-quick's resolvconf
+     path is missing or dead on minimal systems and its failure kills the
+     tunnel. wg-undo.sh applies DNS at PostUp instead - resolvectl when the
+     daemon is reachable, else a recorded in-place /etc/resolv.conf write,
+     else skipped with a NOTE - and the tunnel comes up in every case; the
+     down replay restores DNS exactly
+   - validates the conf statically (wg-quick strip) and probes interface-
+     creation capability with a throwaway name; it never activates the
+     tunnel, so it is safe in image builds and provisioning pipelines
+     without NET_ADMIN
+3. Activate (separate, deliberate step, on the running system):
+   with systemd:    systemctl enable --now wg-quick@@IFACE@
+   without systemd: wg-quick up @IFACE@
+4. Verify: wg show @IFACE@ (expect a handshake within seconds), then
+   ping @SERVER_TUN_IP@.
+5. Remove: sudo ./uninstall.sh - downs the tunnel (PreDown replays the undo
+   file), removes the config; wireguard-tools stays installed.
+
+Destinations routed into the tunnel: @ALLOWED@
+Endpoint: @ENDPOINT@ (the public port is already correct - do not change it)
+
+Extra routes that wg-quick does not cover (for example a subnet reached via a
+second gateway INSIDE the tunnel) belong in /etc/wireguard/@IFACE@.extra-routes,
+one per line: 'CIDR' or 'CIDR via GATEWAY'. PostUp applies them through
+wg-undo.sh so each one is recorded first and removed again on the way down.
+Never add such routes by hand - unrecorded routes are exactly what outlives a
+tunnel and breaks the network afterwards.
+TPL_I_LINUX
+}
+
+undo_linux() {
+cat <<'TPL_U_LINUX'
+Undo data: /var/lib/wireguard-undo/@IFACE@.undo.jsonl - one JSON line
+{action, ..., prev} appended BEFORE each change (extra routes, sysctls, DNS).
+PreDown runs 'wg-undo.sh down @IFACE@', which replays the file newest-first:
+route-add entries are deleted (already-gone is fine, not an error), sysctl
+entries are restored to their recorded 'prev', resolv-conf entries restore
+the EXACT prior bytes of /etc/resolv.conf from the recorded prev_b64 (in
+place, never a rename - container resolv.conf is often a bind mount), and
+dns-resolvectl entries revert per-interface DNS where possible (that state
+dies with the interface anyway) - then the file is removed. Running down
+twice is clean, and a route that is not in the file is never touched.
+Routes that wg-quick installs itself are deliberately NOT recorded:
+wg-quick removes its own work on the way down.
+TPL_U_LINUX
+}
+
+instr_windows() {
+cat <<'TPL_I_WIN'
+WireGuard client bundle for @NAME@ (config: @CFG@) - Windows
+
+Files: @CONFFILE@, install.ps1, down.ps1, uninstall.ps1.
+All scripts are PowerShell 5.1 compatible. Run them from an ELEVATED
+PowerShell prompt in the bundle directory (if scripts are blocked:
+Set-ExecutionPolicy -Scope Process Bypass).
+
+1. .\install.ps1
+   - installs WireGuard via winget, falling back to the official MSI from
+     download.wireguard.com (the script prints the download's SHA256 - verify
+     it against https://download.wireguard.com/windows-client/ before
+     trusting the install)
+   - snapshots the IPv4 route table, installs the tunnel as a Windows service
+     (wireguard.exe /installtunnelservice), waits for it to run, snapshots
+     again and records every route that appeared to the undo file. Windows'
+     WireGuard client does not run PostUp/PreDown scripts by default, which
+     is why the recording happens here around service creation.
+2. Verify in the WireGuard app (expect a recent handshake), then:
+   ping @SERVER_TUN_IP@
+3. .\down.ps1 - stops and removes the tunnel service, then replays the undo
+   file in reverse (deletes only recorded leftover routes) and removes it.
+4. .\uninstall.ps1 - down.ps1 plus cleanup. The WireGuard app itself stays;
+   remove it with: winget uninstall WireGuard.WireGuard
+
+Destinations routed into the tunnel: @ALLOWED@
+Endpoint: @ENDPOINT@ (the public port is already correct - do not change it)
+TPL_I_WIN
+}
+
+undo_windows() {
+cat <<'TPL_U_WIN'
+Undo data: %ProgramData%\WireGuardUndo\@BASE@.undo.jsonl - one JSON line
+{action:"route-add", destination, interface, nexthop, prev:null} for every
+IPv4 route that appeared while the tunnel came up (before/after Get-NetRoute
+snapshot diff, recorded before anything else changes). down.ps1 replays it
+in reverse: each recorded route still present is deleted (already-gone is
+fine), then the file is removed. Safe to run twice, and a route that was not
+recorded is never deleted. The tunnel service normally removes its own
+routes at uninstall; the replay catches exactly the leftovers that would
+otherwise outlive the tunnel.
+TPL_U_WIN
+}
+
+instr_freebsd() {
+cat <<'TPL_I_BSD'
+WireGuard client bundle for @NAME@ (config: @CFG@) - FreeBSD
+
+Files: @CONFFILE@, install.sh, wg-undo.sh, uninstall.sh (all POSIX sh).
+
+1. Copy the files into one directory; run as root: sh ./install.sh
+   - pkg install wireguard-tools (skipped when already present)
+   - config -> /usr/local/etc/wireguard/@IFACE@.conf (0600), undo helper ->
+     /usr/local/etc/wireguard/wg-undo.sh
+   - rc.conf: wireguard_enable=YES and @IFACE@ appended to
+     wireguard_interfaces - each key's PRIOR value (or its absence) is
+     captured to the install undo file BEFORE the change
+   - brings the tunnel up with wg-quick; if wg-quick is absent it falls back
+     to the manual path (ifconfig wg create + wg setconf) where every
+     route(8) add goes through wg-undo.sh and is recorded
+2. Verify: wg show @IFACE@, then ping @SERVER_TUN_IP@
+3. Remove: sh ./uninstall.sh - downs the tunnel, replays the route undo file,
+   then restores the rc.conf keys to their captured values (keys that did not
+   exist before are deleted again with sysrc -x).
+
+Destinations routed into the tunnel: @ALLOWED@
+Endpoint: @ENDPOINT@ (the public port is already correct - do not change it)
+
+Extra routes beyond the AllowedIPs list belong in
+/usr/local/etc/wireguard/@IFACE@.extra-routes ('CIDR' or 'CIDR via GW' per
+line); PostUp applies them through wg-undo.sh so they are recorded and undone
+with the tunnel.
+TPL_I_BSD
+}
+
+undo_freebsd() {
+cat <<'TPL_U_BSD'
+Two undo files under /var/db/wireguard-undo/:
+- @IFACE@.undo.jsonl (runtime): every route(8) change, recorded before it is
+  made; 'wg-undo.sh down/replay' replays it in reverse on the way down -
+  already-gone routes are fine, unrecorded routes are never touched - then
+  removes the file. Idempotent.
+- @IFACE@.install.jsonl (install-time): each rc.conf key with its prior value
+  ({"action":"sysrc","key":...,"prev":...}); prev:null means the key did not
+  exist. uninstall.sh replays it via 'wg-undo.sh replay-install', restoring
+  every key and deleting the ones that were absent before.
+Routes wg-quick adds itself are NOT recorded - wg-quick undoes its own work.
+TPL_U_BSD
+}
+
+instr_pfsense() {
+cat <<'TPL_I_PF'
+WireGuard client setup for @NAME@ (config: @CFG@) - pfSense
+
+WHY THERE IS NO install SCRIPT IN THIS BUNDLE: pfSense is FreeBSD, but
+config.xml is the single source of truth. The GUI/configd re-applies it on
+boot, on every filter reload and on interface events. A shell script that
+adds routes, gateways or interfaces behind its back holds only until the
+next re-apply: the change is silently reverted - or worse, half survives,
+and the GUI now disagrees with the kernel (ghost routes, duplicate gateways,
+states that never clear, and an XML restore that wipes it all). Routing and
+interfaces MUST therefore be created in the GUI, where they are also cleanly
+undone. The only script here, verify.sh, is strictly read-only.
+
+All values below come from @CONFFILE@ in this bundle. The private key is
+NEVER written in these instructions - take it from the PrivateKey line in
+the [Interface] section of the conf file, and paste it only into the one
+Private Key field named below.
+
+A. Package
+ 1. System > Package Manager > Available Packages: install "WireGuard".
+B. Tunnel
+ 2. VPN > WireGuard > Tunnels > Add Tunnel.
+ 3. Enable; Description: @BASE@. Listen Port: leave default (client role).
+    Interface Keys: paste the PrivateKey value FROM THE CONF FILE - the
+    public key derives automatically. Save Tunnel.
+C. Peer (the EDT1 server)
+ 4. VPN > WireGuard > Peers > Add Peer. Tunnel: tun_wg0 (@BASE@).
+ 5. Dynamic Endpoint: unchecked. Endpoint: @ENDPOINT_HOST@  Port:
+    @ENDPOINT_PORT@ (this is the PUBLIC port the server is reached on -
+    keep it).
+ 6. Public Key: @SERVER_PUBKEY@
+ 7. Keep Alive: @KEEPALIVE@. Allowed IPs: @ALLOWED@
+    Save Peer, then Apply Changes.
+D. Interface assignment
+ 8. Interfaces > Assignments: select the new tun_wg0 device, Add, then open
+    the created OPTx interface.
+ 9. Enable; Description: WG@CFG@. IPv4 Configuration Type: Static IPv4;
+    IPv4 Address: @ADDR_IP@ / 24 (the tunnel network mask, so a gateway can
+    live on it). MTU: @MTU@. Save, Apply Changes.
+E. Gateway and static routes - the part config.xml MUST own
+10. System > Routing > Gateways > Add: Interface WG@CFG@, Address Family
+    IPv4, Name WG@CFG@_GW, Gateway @SERVER_TUN_IP@. Save, Apply.
+11. System > Routing > Static Routes > Add, one per destination, all via
+    WG@CFG@_GW: @ROUTE_LIST@
+    Skip @TUNNEL_CIDR@ - that is the interface's own network. If Allowed
+    IPs is 0.0.0.0/0, do NOT create a 0.0.0.0/0 static route; make the
+    gateway the default (System > Routing) or use policy routing on
+    firewall rules instead.
+F. Firewall
+12. Firewall > Rules > WG@CFG@ tab: add pass rules for the traffic this
+    tunnel should carry (default is block).
+G. Verify - read-only
+13. Copy verify.sh to the box (Diagnostics > Command Prompt upload, or scp)
+    and run: sh verify.sh
+    It checks the handshake age, each expected route and reachability of
+    @SERVER_TUN_IP@, and changes nothing.
+
+UNDO: remove the objects in reverse creation order - static routes, gateway,
+interface assignment, peer, tunnel, package - or roll the whole change back
+in Diagnostics > Backup & Restore > Config History. Because every change
+lived in config.xml, removal is complete: nothing lingers in the routing
+table afterwards.
+TPL_I_PF
+}
+
+instr_opnsense() {
+cat <<'TPL_I_OPN'
+WireGuard client setup for @NAME@ (config: @CFG@) - OPNsense
+
+WHY THERE IS NO install SCRIPT IN THIS BUNDLE: OPNsense is FreeBSD, but
+config.xml is the single source of truth. configd re-applies it on boot, on
+every reconfigure and on interface events. A shell script that adds routes,
+gateways or interfaces behind its back holds only until the next re-apply:
+the change is silently reverted - or worse, half survives, and the GUI now
+disagrees with the kernel (ghost routes, duplicate gateways, and a config
+backup/restore that wipes it all). Routing and interfaces MUST therefore be
+created in the GUI, where they are also cleanly undone. The only script
+here, verify.sh, is strictly read-only.
+
+All values below come from @CONFFILE@ in this bundle. The private key is
+NEVER written in these instructions - take it from the PrivateKey line in
+the [Interface] section of the conf file, and paste it only into the one
+Private key field named below.
+
+A. Plugin
+ 1. System > Firmware > Plugins: install os-wireguard (reload the page after
+    install so the VPN > WireGuard menu appears).
+B. Instance (this firewall's side of the tunnel)
+ 2. VPN > WireGuard > Instances > Add.
+ 3. Enabled; Name: @BASE@. Public/Private keys: paste the PrivateKey value
+    FROM THE CONF FILE into "Private key" (the public key derives).
+    Listen port: leave empty (client role). Tunnel address: @ADDR_IP@/24
+    (the tunnel network mask, so a gateway can live on it). MTU: @MTU@.
+    Save.
+C. Peer (the EDT1 server)
+ 4. VPN > WireGuard > Peers > Add. Enabled; Name: edt1-@CFG@.
+    Public key: @SERVER_PUBKEY@
+    Allowed IPs: @ALLOWED@
+    Endpoint address: @ENDPOINT_HOST@; Endpoint port: @ENDPOINT_PORT@
+    (this is the PUBLIC port - keep it). Keepalive interval: @KEEPALIVE@.
+    Instances: @BASE@. Save, then Apply; make sure WireGuard is Enabled on
+    the Instances tab.
+D. Interface assignment
+ 5. Interfaces > Assignments: assign the new wg device (wg0/wg1...), give it
+    description WG@CFG@, open it, tick Enable. Leave IPv4/IPv6 Configuration
+    Type on "None" - the instance already owns @ADDR_IP@. Save, Apply.
+E. Gateway and static routes - the part config.xml MUST own
+ 6. System > Gateways > Configuration > Add: Interface WG@CFG@, Address
+    Family IPv4, IP address @SERVER_TUN_IP@, Name WG@CFG@_GW; tick
+    "Far Gateway"; disabling gateway monitoring is reasonable here. Save,
+    Apply.
+ 7. System > Routes > Configuration > Add, one per destination, all via
+    WG@CFG@_GW: @ROUTE_LIST@
+    Skip @TUNNEL_CIDR@ - that is the tunnel's own network. If Allowed IPs
+    is 0.0.0.0/0, do NOT create a 0.0.0.0/0 static route; use the default
+    gateway settings or policy routing on firewall rules instead.
+F. Firewall
+ 8. Firewall > Rules > WG@CFG@: add pass rules for the traffic this tunnel
+    should carry (default is block).
+G. Verify - read-only
+ 9. Copy verify.sh to the box (scp, or paste via an SSH session) and run:
+    sh verify.sh
+    It checks the handshake age, each expected route and reachability of
+    @SERVER_TUN_IP@, and changes nothing.
+
+UNDO: remove the objects in reverse creation order - static routes, gateway,
+interface assignment, peer, instance, plugin - or restore an earlier config
+from System > Configuration > Backups. Because every change lived in
+config.xml, removal is complete: nothing lingers in the routing table.
+TPL_I_OPN
+}
+
+undo_pf_opn() {
+cat <<'TPL_U_PFOPN'
+No script in this bundle changes anything on the firewall, so there is no
+undo file to replay: on pfSense/OPNsense the config system IS the undo
+mechanism. config.xml versioning is the transaction log - remove the created
+objects in reverse order (static routes, gateway, interface assignment,
+peer, tunnel/instance, package/plugin) or roll back to the pre-change
+config revision, and nothing lingers afterwards. That guarantee is exactly
+why scripted route edits are refused here: a route added behind config.xml's
+back is invisible to that log, gets reverted on the next re-apply, and is
+the classic way a WireGuard experiment leaves a firewall subtly broken.
+verify.sh is read-only and leaves no state behind.
+TPL_U_PFOPN
+}
+
+# ------------------------------------------------------------ bundle builds --
+
+build_linux() {
+    local conf hooks="/etc/wireguard/wg-undo.sh"
+    # The linux conf carries NO "DNS =" line: wg-quick applies DNS through
+    # resolvconf(8), which is missing or not running on minimal systems and
+    # containers, and its failure tears the tunnel down. wg-undo.sh applies
+    # DNS at PostUp instead (resolvectl -> recorded in-place resolv.conf
+    # write -> skip with a NOTE), with full undo. Other OS templates keep
+    # their DNS handling (e.g. Windows' tunnel service does DNS natively).
+    conf="$(sed -E 's|^[[:space:]]*DNS[[:space:]]*=.*$|# DNS deliberately not set here: wg-undo.sh applies it at PostUp with undo|' \
+                <<<"$CONF_CONTENT" | inject_hooks "$hooks")"
+    add_file "$CONFFILE"    0600 "$conf"                                  none
+    add_file "install.sh"   0755 "$(render "$(tpl_linux_install)")"       bash
+    add_file "wg-undo.sh"   0755 "$(render "$(tpl_linux_undo)")"          bash
+    add_file "uninstall.sh" 0755 "$(render "$(tpl_linux_uninstall)")"     bash
+    INSTRUCTIONS="$(render "$(instr_linux)")"
+    UNDO_NOTE="$(render "$(undo_linux)")"
+}
+
+build_windows() {
+    add_file "$CONFFILE"      0600 "$CONF_CONTENT"                        none
+    add_file "install.ps1"   0755 "$(render "$(tpl_win_install)")"        ps1
+    add_file "down.ps1"      0755 "$(render "$(tpl_win_down)")"           ps1
+    add_file "uninstall.ps1" 0755 "$(render "$(tpl_win_uninstall)")"      ps1
+    INSTRUCTIONS="$(render "$(instr_windows)")"
+    UNDO_NOTE="$(render "$(undo_windows)")"
+}
+
+build_freebsd() {
+    local conf hooks="/usr/local/etc/wireguard/wg-undo.sh"
+    conf="$(inject_hooks "$hooks" <<<"$CONF_CONTENT")"
+    add_file "$CONFFILE"    0600 "$conf"                                  none
+    add_file "install.sh"   0755 "$(render "$(tpl_bsd_install)")"         sh
+    add_file "wg-undo.sh"   0755 "$(render "$(tpl_bsd_undo)")"            sh
+    add_file "uninstall.sh" 0755 "$(render "$(tpl_bsd_uninstall)")"       sh
+    INSTRUCTIONS="$(render "$(instr_freebsd)")"
+    UNDO_NOTE="$(render "$(undo_freebsd)")"
+}
+
+build_pfsense() {
+    INSTRUCTIONS="$(render "$(instr_pfsense)")"
+    UNDO_NOTE="$(render "$(undo_pf_opn)")"
+    add_file "$CONFFILE"     0600 "$CONF_CONTENT"                         none
+    add_file "gui-setup.txt" 0644 "$INSTRUCTIONS"                         none
+    add_file "verify.sh"     0755 "$(render "$(tpl_verify)")"             sh
+}
+
+build_opnsense() {
+    INSTRUCTIONS="$(render "$(instr_opnsense)")"
+    UNDO_NOTE="$(render "$(undo_pf_opn)")"
+    add_file "$CONFFILE"     0600 "$CONF_CONTENT"                         none
+    add_file "gui-setup.txt" 0644 "$INSTRUCTIONS"                        none
+    add_file "verify.sh"     0755 "$(render "$(tpl_verify)")"             sh
+}
+
+# ----------------------------------------------------------- lint at emit --
+
+# Every generated script is written to a private scratch dir and syntax
+# checked BEFORE the JSON is emitted; a failure refuses the whole bundle.
+# The .conf is never written here - it holds the private key and contains no
+# script to lint.
+# NOTE the trap handler must always return 0: under `set -e` a failing last
+# command in an EXIT trap overwrites the script's own exit status.
+LINT_DIR=""
+cleanup() { if [[ -n "$LINT_DIR" ]]; then rm -rf "$LINT_DIR"; fi; }
+trap cleanup EXIT
+
+lint_all() {
+    local i name lint p rc=0 pwsh_bin=""
+    LINT_DIR="$(mktemp -d /tmp/wg-admin-package.XXXXXX)"
+    chmod 0700 "$LINT_DIR"
+
+    pwsh_bin="$(command -v pwsh || true)"
+    if [[ -z "$pwsh_bin" && -x /snap/bin/pwsh ]]; then pwsh_bin=/snap/bin/pwsh; fi
+    if [[ -n "$pwsh_bin" ]] && ! "$pwsh_bin" -NoProfile -NonInteractive -Command 'exit 0' \
+            >/dev/null 2>&1; then
+        pwsh_bin=""
+    fi
+
+    for i in "${!FILE_NAMES[@]}"; do
+        lint="${FILE_LINTS[$i]}"
+        if [[ "$lint" == "none" ]]; then continue; fi
+        name="${FILE_NAMES[$i]}"
+        p="$LINT_DIR/$name"
+        printf '%s' "${FILE_CONTENTS[$i]}" > "$p"
+        case "$lint" in
+        bash)
+            if bash -n "$p" >&2; then
+                err "lint ok: $name (bash -n)"
+            else
+                err "generated $name FAILS bash -n"
+                rc=1
+            fi
+            ;;
+        sh)
+            if sh -n "$p" >&2; then
+                err "lint ok: $name (sh -n, POSIX)"
+            else
+                err "generated $name FAILS sh -n"
+                rc=1
+            fi
+            ;;
+        ps1)
+            if [[ -n "$pwsh_bin" ]]; then
+                if PS_LINT_PATH="$p" "$pwsh_bin" -NoProfile -NonInteractive -Command '
+                        $t = $null; $e = $null
+                        [void][System.Management.Automation.Language.Parser]::ParseFile($env:PS_LINT_PATH, [ref]$t, [ref]$e)
+                        if ($e.Count) { $e | ForEach-Object { [Console]::Error.WriteLine($_.Message) }; exit 1 }
+                    ' >&2; then
+                    err "lint ok: $name (PowerShell parser)"
+                else
+                    err "generated $name FAILS the PowerShell parser"
+                    rc=1
+                fi
+            else
+                err "pwsh not installed on this host: $name was NOT machine-parsed; it is written to the PowerShell 5.1 syntax subset and shipped after manual review only"
+            fi
+            ;;
+        esac
+    done
+
+    rm -rf "$LINT_DIR"
+    LINT_DIR=""
+    if (( rc != 0 )); then
+        die "refusing to emit: generated script(s) failed their linter"
+    fi
+}
+
+# ------------------------------------------------------------------ emission --
+
+# JSON is assembled from the ENVIRONMENT, never from argv: the conf content
+# carries the private key, /proc/<pid>/cmdline is world-readable, and
+# /proc/<pid>/environ is owner-only. This mirrors wg-admin's use of
+# --rawfile for the same reason.
+build_files_json() {
+    local i
+    for i in "${!FILE_NAMES[@]}"; do
+        F_NAME="${FILE_NAMES[$i]}" F_MODE="${FILE_MODES[$i]}" \
+        F_CONTENT="${FILE_CONTENTS[$i]}" \
+            jq -nc '{name: env.F_NAME, mode: env.F_MODE, content: env.F_CONTENT}'
+    done
+}
+
+emit() {
+    build_files_json | OS_="$OS" INSTR_="$INSTRUCTIONS" UNDO_="$UNDO_NOTE" \
+        jq -sc '{os: env.OS_, files: ., instructions: env.INSTR_, undo_note: env.UNDO_}'
+}
+
+# ---------------------------------------------------------------------- main --
+
+main() {
+    local osarg=""
+    # wg-admin dispatches "client-package NAME CFG --os X" verbatim: accept
+    # and drop the leading verb word.
+    if [[ "${1:-}" == "client-package" ]]; then shift; fi
+
+    while (($#)); do
+        case "$1" in
+            --os)
+                [[ $# -ge 2 ]] || die "client-package: --os needs a value"
+                osarg="$2"; shift 2 ;;
+            --os=*)
+                osarg="${1#--os=}"; shift ;;
+            -h|--help)
+                usage; exit 0 ;;
+            --version)
+                jq -nc --arg version "$VERSION" '{version: $version}'; exit 0 ;;
+            --) shift ;;
+            -*) die "client-package: unknown option: $1" ;;
+            *)
+                if [[ -z "$NAME" ]]; then NAME="$1"
+                elif [[ -z "$CFG" ]]; then CFG="$1"
+                else die "client-package: unexpected argument: $1"
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -n "$NAME" && -n "$CFG" ]] || { usage; die "client-package: NAME and CFG are required" 2; }
+    valid_name "$NAME" || die "invalid client name: $NAME"
+    valid_name "$CFG"  || die "invalid config name: $CFG"
+    case "$osarg" in
+        linux|windows|freebsd|pfsense|opnsense) OS="$osarg" ;;
+        "") die "client-package: --os is required (windows|linux|pfsense|opnsense|freebsd)" ;;
+        *)  die "client-package: unsupported --os: $osarg (windows|linux|pfsense|opnsense|freebsd)" ;;
+    esac
+
+    need_root
+    need_tools jq sed awk tr mktemp
+
+    # ---- read wg-admin's client state (read-only; never modified here) ----
+    local d confp
+    d="$CLIENTS_DIR/$NAME"
+    [[ -d "$d" ]] || die "no such client: $NAME (run new-client first)"
+    confp="$d/cfg-${CFG}.conf"
+    [[ -f "$confp" ]] || die "no such config: ${NAME}/${CFG} (run add-config first)"
+    CONF_CONTENT="$(<"$confp")"
+
+    ENDPOINT="$(conf_field Endpoint)"
+    ALLOWED="$(conf_field AllowedIPs)"
+    ADDR_IP="$(conf_field Address)"; ADDR_IP="${ADDR_IP%%/*}"
+    MTU="$(conf_field MTU)";                     : "${MTU:=$DEFAULT_MTU}"
+    DNS="$(conf_field DNS)";                     : "${DNS:=$DEFAULT_DNS}"
+    KEEPALIVE="$(conf_field PersistentKeepalive)"; : "${KEEPALIVE:=$DEFAULT_KEEPALIVE}"
+    SERVER_PUBKEY="$(conf_field PublicKey)"
+
+    [[ -n "$ENDPOINT" ]]      || die "stored conf ${NAME}/${CFG} has no Endpoint line"
+    [[ -n "$ALLOWED" ]]       || die "stored conf ${NAME}/${CFG} has no AllowedIPs line"
+    [[ -n "$ADDR_IP" ]]       || die "stored conf ${NAME}/${CFG} has no Address line"
+    [[ -n "$SERVER_PUBKEY" ]] || die "stored conf ${NAME}/${CFG} has no PublicKey line"
+
+    ENDPOINT_HOST="${ENDPOINT%:*}"
+    ENDPOINT_PORT="${ENDPOINT##*:}"
+    if [[ "$ENDPOINT_HOST" == "$ENDPOINT_PLACEHOLDER" ]]; then
+        err "warning: the stored conf still carries ${ENDPOINT_PLACEHOLDER}; replace it before deploying this bundle"
+    fi
+
+    ALLOWED_SPACED="$(printf '%s' "$ALLOWED" | tr ',' ' ' | tr -s ' ' \
+                      | sed 's/^ //; s/ $//')"
+
+    local c
+    ROUTE_LIST=""
+    for c in $ALLOWED_SPACED; do
+        if [[ "$c" == "$TUNNEL_CIDR" || "$c" == "0.0.0.0/0" ]]; then continue; fi
+        if [[ -z "$ROUTE_LIST" ]]; then ROUTE_LIST="$c"; else ROUTE_LIST="$ROUTE_LIST, $c"; fi
+    done
+    [[ -n "$ROUTE_LIST" ]] \
+        || ROUTE_LIST="(none needed - every destination is on the tunnel network itself)"
+
+    # ---- derived names ----
+    BASE="${NAME}-${CFG}"
+    BASE_EFF="$BASE"
+    IFACE="$BASE"
+    if (( ${#IFACE} > 15 )); then
+        IFACE="${IFACE:0:15}"
+        err "interface name truncated to '${IFACE}' (Linux IFNAMSIZ limit)"
+    fi
+    if [[ "$OS" == "windows" && ${#BASE} -gt 32 ]]; then
+        BASE_EFF="${BASE:0:32}"
+        err "Windows tunnel name truncated to '${BASE_EFF}' (32-char service limit)"
+    fi
+    CONFFILE="${BASE_EFF}.conf"
+
+    case "$OS" in
+        linux)    build_linux ;;
+        windows)  build_windows ;;
+        freebsd)  build_freebsd ;;
+        pfsense)  build_pfsense ;;
+        opnsense) build_opnsense ;;
+    esac
+
+    lint_all
+    emit
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
