@@ -93,7 +93,7 @@ Test-NetConnection 172.30.10.12 -Port 443                # the reverse proxy
 On the full profile, confirm your egress is edt1's and not the local link:
 
 ```powershell
-(Invoke-RestMethod https://api.ipify.org?format=json).ip   # expect 45.19.59.138
+(Invoke-RestMethod https://api.ipify.org?format=json).ip   # expect the server public IP from Endpoint in the .conf
 ```
 
 Every destination below is verified reachable from a tunnelled client:
