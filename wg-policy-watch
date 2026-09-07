@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+#
+# wg-policy-watch - reconcile the stored routing policy whenever a WireGuard
+#                   client connects.
+#
+# WHY A WATCHER AND NOT A wg-quick HOOK
+#   PostUp/PreDown fire when the INTERFACE comes up, which on a server happens
+#   once at boot. They say nothing about a CLIENT connecting hours later. The
+#   failure this guards against is exactly that: the tunnel has been up for days,
+#   podman or libvirt restarted at some point and rebuilt its chains (dropping
+#   the forward rules), and the next client to connect gets a clean handshake and
+#   routes nothing. So the trigger has to be the handshake, not the interface.
+#
+# HOW THIS TRIGGERS
+#   Reconciling is idempotent and costs a handful of `iptables -S` reads, so this
+#   simply reconciles on EVERY tick rather than trying to tell a genuine client
+#   connect apart from WireGuard's routine ~2-minute rekey. That distinction is
+#   not reliably observable from `wg show` -- an earlier version of this script
+#   only reconciled when a peer had been quiet longer than a staleness threshold,
+#   and a real client reconnecting inside that window was silently ignored while
+#   the routes stayed broken.
+#
+#   Handshake timestamps are still tracked, but only to LOG which client caused a
+#   repair. Correctness never depends on classifying the event correctly: drift is
+#   corrected within one poll interval whether or not anyone connected, which also
+#   covers the podman/libvirt-restart case where no client event happens at all.
+
+set -Eeuo pipefail
+
+WG_POLICY="${WG_POLICY_BIN:-/usr/local/sbin/wg-policy}"
+INTERVAL="${WG_POLICY_INTERVAL:-10}"     # seconds between polls
+STATE="${WG_POLICY_WATCH_STATE:-/run/wg-policy-watch.state}"
+
+log() { printf '%s wg-policy-watch: %s\n' "$(date -Is)" "$*"; }
+
+command -v wg >/dev/null 2>&1 || { log "wg not found"; exit 1; }
+[[ -x "$WG_POLICY" ]] || { log "wg-policy not executable at $WG_POLICY"; exit 1; }
+
+# `wg show all dump` emits a 5-field INTERFACE line per device before its
+# 9-field PEER lines, and field 2 of that interface line is the device's PRIVATE
+# KEY. Filtering on NF>=5 therefore treats the interface as a peer and logs a
+# fragment of the private key. Peer lines are the only ones with >=8 fields.
+declare -A LAST_HS
+
+# Seed from the current state so a restart of this service does not treat every
+# already-connected peer as a fresh connect.
+seed() {
+    local ifc pub hs
+    while read -r ifc pub hs; do
+        [[ -n "${pub:-}" ]] || continue
+        LAST_HS["$ifc/$pub"]="$hs"
+    done < <(wg show all dump 2>/dev/null | awk 'NF>=8 {print $1, $2, $6}')
+    log "seeded ${#LAST_HS[@]} peer(s)"
+}
+
+reconcile() {
+    local why="$1" out
+    if out="$("$WG_POLICY" apply 2>&1)"; then
+        # only speak up when something actually changed; a no-op reconcile on
+        # every connect would bury the real events in noise
+        if grep -qE '^\s+\+' <<<"$out"; then
+            log "$why -> policy drift corrected:"
+            sed 's/^/    /' <<<"$out"
+        fi
+    else
+        log "$why -> wg-policy apply FAILED:"
+        sed 's/^/    /' <<<"$out"
+    fi
+}
+
+seed
+# Reconcile once at start: the window this service exists to close may already
+# be open when it starts.
+reconcile "startup"
+
+while :; do
+    # Note who (re)connected, for the log only.
+    connected=""
+    while read -r ifc pub hs; do
+        [[ -n "${pub:-}" ]] || continue
+        key="$ifc/$pub"
+        prev="${LAST_HS[$key]:-}"
+        LAST_HS["$key"]="$hs"
+        if [[ -z "$prev" ]]; then
+            connected="new peer ${ifc}/${pub:0:12}"
+        elif (( hs > prev )) && (( prev == 0 )); then
+            connected="first handshake on ${ifc}/${pub:0:12}"
+        fi
+    done < <(wg show all dump 2>/dev/null | awk 'NF>=8 {print $1, $2, $6}')
+
+    # Reconcile unconditionally: cheap, idempotent, and the only thing that
+    # actually guarantees a connecting client finds working routes.
+    reconcile "${connected:-periodic}"
+
+    sleep "$INTERVAL"
+done

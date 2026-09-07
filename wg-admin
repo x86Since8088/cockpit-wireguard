@@ -1,0 +1,1975 @@
+#!/bin/bash
+#
+# wg-admin - root helper for the Cockpit WireGuard plugin on host EDT1.
+#
+# Implements the verb interface defined in docs/CONTRACT.md. Every verb prints
+# exactly one JSON object on stdout and nothing else. Diagnostics go to stderr.
+# Exit 0 means success; on failure a {"error": "..."} object is printed and the
+# exit status is non-zero.
+#
+# SECURITY - non-negotiable
+#   Private key material is generated under `umask 077`, written only to
+#   /etc/wireguard/clients/<name>/ with mode 0600, and emitted on stdout ONLY
+#   inside the `get-config` verb. It is never written to stderr and never
+#   logged. The job runner's logs are group-readable, so do NOT add `set -x`
+#   to this script and never cat a file that contains a PrivateKey line.
+#
+# The whole point of this tool is that "AllowedIPs" means two different things
+# on the two ends of a WireGuard link:
+#
+#   client [Peer] AllowedIPs -> destinations the client routes INTO the tunnel
+#   server [Peer] AllowedIPs -> cryptokey routing; the client's /32 ONLY
+#
+# Both sides are derived here from ONE route selection so they cannot disagree.
+#
+set -euo pipefail
+shopt -s nullglob
+umask 077
+
+VERSION="2.0.0"
+
+# ---------------------------------------------------------------- constants --
+
+WG_IF="wg0"
+TUNNEL_CIDR="172.16.0.0/24"
+TUNNEL_PREFIX="172.16.0"
+TUNNEL_FIRST=2
+TUNNEL_LAST=254
+
+# .1 is this server and .11 is the ELT laptop peer. Both are hard-reserved on
+# top of whatever is discovered dynamically from wg(8), netplan and the client
+# store, so neither can ever be handed out even if discovery fails.
+declare -ra RESERVED_OCTETS=(1 11)
+
+STATE_DIR="/etc/wireguard"
+CLIENTS_DIR="${STATE_DIR}/clients"
+LOCK_FILE="${STATE_DIR}/.wg-admin.lock"
+ROUTES_STATE="${STATE_DIR}/wg-admin-routes"
+CONF_FILE="${STATE_DIR}/wg-admin.conf"
+
+NAT_UNIT="wg-lan-nat.service"
+NAT_DROPIN_DIR="/etc/systemd/system/${NAT_UNIT}.d"
+NAT_DROPIN="${NAT_DROPIN_DIR}/50-wg-admin.conf"
+
+# sysctl applies drop-ins in lexicographic BASENAME order across /usr/lib, /run
+# and /etc, and the last one wins. "99-zz-" is deliberate: this host already
+# ships /etc/sysctl.d/99-wireguard-forward.conf, and plain "99-wg-admin-" sorts
+# BEFORE "99-wireguard-" ('g' < 'i'), which would have let that file override a
+# persisted "off" at the next boot.
+SYSCTL_DROPIN="/etc/sysctl.d/99-zz-wg-admin-ip-forward.conf"
+# Older name, cleaned up on sight so the two cannot disagree.
+SYSCTL_DROPIN_OLD="/etc/sysctl.d/99-wg-admin-ip-forward.conf"
+
+# A catalogue id that is a host SETTING, not a routable destination. It is
+# addressable by routing-set but must never be accepted by --routes.
+SETTING_IP_FORWARD="ip_forward"
+
+# ------------------------------------------------------------ IPAM constants --
+
+IPAM_FILE_DEFAULT="${STATE_DIR}/ipam.json"
+
+# Subnets the ipam verbs may operate on. `lan` is deliberately OPT-IN: the
+# default is always `tunnel`, so the physical LAN is only ever swept when the
+# caller passes --net lan explicitly.
+declare -ra IPAM_NETS=(tunnel lab static-edt lan)
+IPAM_SCAN_CONCURRENCY=32
+IPAM_HOST_FIRST=2      # .0 is the network, .1 the host/gateway on every pool
+IPAM_HOST_LAST=254     # .255 is broadcast
+
+DEFAULT_MTU=1420
+DEFAULT_KEEPALIVE=25
+DEFAULT_DNS="8.8.8.8"
+DEFAULT_PORT=51820
+MTU_MIN=1280
+MTU_MAX=1500
+ENDPOINT_PLACEHOLDER="<PUBLIC-ENDPOINT>"
+
+EP_PLACEHOLDER="false"   # set by build_conf from resolve_endpoint
+EP_ENDPOINT=""           # effective "host:port" written into the client conf
+EP_PORT=""               # effective public port
+NEEDS_APPLY="false"      # set by persist_peer when netplan was rewritten
+
+# ------------------------------------------------------------------ plumbing --
+
+err() { printf 'wg-admin: %s\n' "$*" >&2; }
+
+# die() is for the top-level control flow: message on stderr, JSON error on
+# stdout, non-zero exit.
+die() {
+    local msg="$1" code="${2:-1}"
+    err "$msg"
+    if command -v jq >/dev/null 2>&1; then
+        jq -nc --arg error "$msg" '{error: $error}'
+    else
+        printf '{"error":"%s"}\n' "${msg//\"/\'}"
+    fi
+    exit "$code"
+}
+
+# bail() is for helpers that run inside $( ) or < <( ). It must NOT print JSON:
+# that output would be captured as the helper's value instead of reaching the
+# caller's stdout.
+bail() { err "$*"; exit 1; }
+
+need_root() {
+    [[ ${EUID:-$(id -u)} -eq 0 ]] || die "must run as root (invoke via superuser)"
+}
+
+need_tools() {
+    local t
+    for t in "$@"; do
+        command -v "$t" >/dev/null 2>&1 || die "required tool not found: $t"
+    done
+}
+
+# The optional override file is PARSED, never sourced - sourcing a config file
+# is a code-execution path we do not want in a root helper.
+conf_get() {
+    local key="$1" def="${2-}" val=""
+    if [[ -r "$CONF_FILE" ]]; then
+        val="$(sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(.*)$/\1/p" \
+              "$CONF_FILE" 2>/dev/null | tail -n1)" || val=""
+        val="${val%%#*}"
+        val="${val%"${val##*[![:space:]]}"}"
+        val="${val#\"}"; val="${val%\"}"
+        val="${val#\'}"; val="${val%\'}"
+    fi
+    if [[ -n "$val" ]]; then printf '%s' "$val"; else printf '%s' "$def"; fi
+}
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]; }
+
+valid_ipv4() {
+    local ip="$1" o
+    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    local IFS='.'
+    for o in $ip; do ((10#$o <= 255)) || return 1; done
+    return 0
+}
+
+# 10# forces base 10: inside (( )) a value like "0080" would otherwise be read
+# as octal, and "0080" is not even valid octal.
+valid_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] || return 1
+    (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+# ----------------------------------------------------------- the catalogue --
+
+net_ids() { printf '%s\n' tunnel lan static-edt lab edy-lab elt-static full; }
+
+net_cidr() {
+    case "$1" in
+        tunnel)     echo "172.16.0.0/24" ;;
+        lan)        echo "192.168.2.0/24" ;;
+        static-edt) echo "172.15.4.0/24" ;;
+        lab)        echo "172.16.4.0/24" ;;
+        edy-lab)    echo "172.20.10.0/24" ;;
+        elt-static) echo "172.16.2.0/25" ;;
+        full)       echo "0.0.0.0/0" ;;
+        *)          return 1 ;;
+    esac
+}
+
+net_desc() {
+    case "$1" in
+        tunnel)     echo "the WireGuard tunnel itself; always included except in full" ;;
+        lan)        echo "the physical LAN behind bridge0" ;;
+        static-edt) echo "podman static network (br-static-edt)" ;;
+        lab)        echo "lab network, static addressing, services via edy-proxy-go" ;;
+        edy-lab)    echo "libvirt edy-lab VM network; hosts the headscale control plane at 172.20.10.1:8085" ;;
+        elt-static) echo "reached through the ELT peer, not this host" ;;
+        full)       echo "default route through the tunnel" ;;
+        *)          return 1 ;;
+    esac
+}
+
+preset_ids() { printf '%s\n' tunnel-only lab lan full; }
+
+preset_routes() {
+    case "$1" in
+        tunnel-only) echo "tunnel" ;;
+        lab)         echo "tunnel,lab,static-edt" ;;
+        lan)         echo "tunnel,lan" ;;
+        full)        echo "full" ;;
+        *)           return 1 ;;
+    esac
+}
+
+# Resolve a comma separated list of catalogue ids into CIDRs, one per line, in
+# catalogue order and deduplicated. `tunnel` is folded in implicitly unless
+# `full` was selected (0.0.0.0/0 already covers it), per the catalogue note in
+# CONTRACT.md: "always included except in full".
+resolve_routes() {
+    local csv="$1" id m cid
+    local -a want=() ids=()
+    local has_full=0
+    IFS=',' read -r -a want <<<"$csv"
+    for id in ${want[@]+"${want[@]}"}; do
+        id="${id//[[:space:]]/}"
+        [[ -n "$id" ]] || continue
+        # ip_forward is published in the catalogue so the UI can address it with
+        # routing-set, but it is a host switch with no CIDR. Reject it here with
+        # a message that points at the right verb rather than "unknown id".
+        if [[ "$id" == "$SETTING_IP_FORWARD" ]]; then
+            bail "'${SETTING_IP_FORWARD}' is a host setting, not a route; use: wg-admin routing-set ${SETTING_IP_FORWARD} on"
+        fi
+        net_cidr "$id" >/dev/null 2>&1 || bail "unknown route id: $id"
+        if [[ "$id" == "full" ]]; then has_full=1; fi
+        ids+=("$id")
+    done
+    ((${#ids[@]})) || bail "--routes needs at least one catalogue id"
+    if (( ! has_full )); then ids+=("tunnel"); fi
+    while read -r cid; do
+        for m in "${ids[@]}"; do
+            if [[ "$m" == "$cid" ]]; then net_cidr "$cid"; break; fi
+        done
+    done < <(net_ids)
+}
+
+# ------------------------------------------------------- server interrogation --
+
+server_pubkey() { wg show "$WG_IF" public-key 2>/dev/null; }
+server_port()   { wg show "$WG_IF" listen-port 2>/dev/null; }
+
+peer_present() {
+    local pub="$1"
+    wg show "$WG_IF" peers 2>/dev/null | grep -Fxq -- "$pub"
+}
+
+# Egress interface for a destination CIDR, empty when the host has no route.
+iface_for_cidr() {
+    local cidr="$1" line=""
+    if [[ "$cidr" == "0.0.0.0/0" ]]; then
+        line="$(ip -o route show default 2>/dev/null | head -n1)" || line=""
+    else
+        line="$(ip -o route show to exact "$cidr" 2>/dev/null | head -n1)" || line=""
+    fi
+    [[ -n "$line" ]] || return 0
+    awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); exit } }' <<<"$line"
+}
+
+detect_dns() {
+    local d dev
+    d="$(conf_get DNS "")"
+    if [[ -n "$d" ]]; then printf '%s' "$d"; return 0; fi
+    if command -v resolvectl >/dev/null 2>&1; then
+        dev="$(iface_for_cidr 0.0.0.0/0)"
+        if [[ -n "$dev" ]]; then
+            d="$(resolvectl dns "$dev" 2>/dev/null | sed -n -E 's/.*: *//p' | tr ' ' '\n' \
+                 | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -n1)" || d=""
+        fi
+    fi
+    if [[ -n "$d" ]]; then printf '%s' "$d"; else printf '%s' "$DEFAULT_DNS"; fi
+}
+
+# The port REMOTE clients must dial. This is NOT the same as the port wg0
+# listens on: the router in front of EDT1 forwards public UDP 1911 to
+# 192.168.2.14:51820, so a config that names 51820 points at a port nothing
+# forwards and the client never completes a handshake. PUBLIC_PORT in
+# wg-admin.conf carries the outside-facing port; server_port() is only a
+# fallback for a host with no NAT in front of it.
+public_port() {
+    local p
+    p="$(conf_get PUBLIC_PORT "")"
+    if [[ -n "$p" ]]; then
+        valid_port "$p" || bail "PUBLIC_PORT in ${CONF_FILE} is not a valid port: $p"
+        printf '%s' "$p"
+        return 0
+    fi
+    p="$(server_port)" || p=""
+    [[ -n "$p" ]] || p="$DEFAULT_PORT"
+    valid_port "$p" || bail "could not determine a valid endpoint port (got: $p)"
+    printf '%s' "$p"
+}
+
+# Prints "ENDPOINT<TAB>is_placeholder<TAB>port", where ENDPOINT is ALREADY a
+# complete host:port string - the caller must not append a port to it. It is
+# always called through $( ), so it cannot set a global; the extra fields travel
+# back in the return value instead.
+resolve_endpoint() {
+    local ep host port ph="false" u epp
+    ep="$(conf_get ENDPOINT "")"
+
+    # An ENDPOINT that already carries a colon is a complete host:port. Appending
+    # the public port here is what produced "1.2.3.4:1911:51820".
+    if [[ -n "$ep" && "$ep" == *:* ]]; then
+        epp="${ep##*:}"
+        valid_port "$epp" \
+            || bail "ENDPOINT in ${CONF_FILE} has an invalid port: $ep"
+        printf '%s\t%s\t%s' "$ep" "false" "$epp"
+        return 0
+    fi
+
+    port="$(public_port)" || exit 1
+
+    if [[ -n "$ep" ]]; then
+        host="$ep"
+    else
+        host=""
+        if [[ "$(conf_get DISCOVER_ENDPOINT 1)" != "0" ]]; then
+            for u in https://api.ipify.org https://ifconfig.me/ip; do
+                host="$(curl -fsS --max-time 4 "$u" 2>/dev/null | tr -d '[:space:]')" || host=""
+                if valid_ipv4 "$host"; then break; fi
+                host=""
+            done
+        fi
+        if [[ -z "$host" ]]; then host="$ENDPOINT_PLACEHOLDER"; ph="true"; fi
+    fi
+    printf '%s:%s\t%s\t%s' "$host" "$port" "$ph" "$port"
+}
+
+# The local listen port and the public port as JSON, for the UI to compare.
+# Degrades to nulls rather than failing when wg(8) cannot be read.
+port_facts_json() {
+    local lp pp
+    lp="$(server_port)" || lp=""
+    pp="$(conf_get PUBLIC_PORT "")"
+    if [[ -z "$pp" ]]; then pp="$lp"; fi
+    if [[ -n "$pp" ]] && ! valid_port "$pp"; then pp=""; fi
+    jq -nc --arg lp "$lp" --arg pp "$pp" '
+        { listen_port: (if $lp == "" then null else ($lp | tonumber) end),
+          public_port: (if $pp == "" then null else ($pp | tonumber) end) }
+        | . + { port_forwarded: (.listen_port != null and .public_port != null
+                                 and .listen_port != .public_port) }'
+}
+
+# ------------------------------------------------------- netplan persistence --
+
+# wg0 here is a NetworkManager connection that netplan owns; NM writes its state
+# back into /etc/netplan/90-NM-<uuid>.yaml. That file is where the existing ELT
+# peer is persisted, so it is where new peers go too - same mechanism, no second
+# source of truth.
+netplan_file() {
+    local f
+    for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
+        [[ -f "$f" ]] || continue
+        if WGADMIN_IF="$WG_IF" python3 - "$f" <<'PY' >/dev/null 2>&1
+import os, sys, yaml
+try:
+    with open(sys.argv[1]) as fh:
+        d = yaml.safe_load(fh) or {}
+except Exception:
+    sys.exit(1)
+t = ((d.get('network') or {}).get('tunnels') or {}).get(os.environ['WGADMIN_IF'])
+sys.exit(0 if isinstance(t, dict) and t.get('mode') == 'wireguard' else 1)
+PY
+        then
+            printf '%s' "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# netplan_peer <file> add|remove <pubkey> [allowed-ips-csv]
+# Prints "changed" or "unchanged". Rewrites the YAML atomically, preserving
+# owner and mode, keeping a .wg-admin.bak copy, and re-parsing the result before
+# it is moved into place. It NEVER runs `netplan apply` - doing so would bounce
+# the wg0 connection and cut the live tunnel.
+netplan_peer() {
+    WGADMIN_IF="$WG_IF" python3 - "$@" <<'PY'
+import os, shutil, sys, tempfile, yaml
+
+path, action, pub = sys.argv[1], sys.argv[2], sys.argv[3]
+aips = [x for x in (sys.argv[4].split(',') if len(sys.argv) > 4 else []) if x]
+ifname = os.environ['WGADMIN_IF']
+
+
+class Q(str):
+    """A string that always round-trips double-quoted.
+
+    netplan's `passthrough` block stores values such as connection.timestamp as
+    STRINGS. If PyYAML re-emitted them unquoted they would load back as ints and
+    netplan would reject the file. Quoting every value (but not the mapping
+    keys) keeps the file in the same shape NetworkManager itself writes.
+    """
+
+
+yaml.add_representer(
+    Q,
+    lambda d, v: d.represent_scalar('tag:yaml.org,2002:str', str(v), style='"'),
+    Dumper=yaml.SafeDumper)
+
+
+def quote_values(o):
+    if isinstance(o, dict):
+        return {k: quote_values(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [quote_values(v) for v in o]
+    if isinstance(o, str):
+        return Q(o)
+    return o
+
+
+with open(path) as fh:
+    data = yaml.safe_load(fh)
+
+tun = data['network']['tunnels'][ifname]
+peers = tun.get('peers') or []
+found = next((p for p in peers
+              if isinstance(p, dict)
+              and (p.get('keys') or {}).get('public') == pub), None)
+
+changed = False
+if action == 'add':
+    if found is None:
+        peers.append({'keys': {'public': pub}, 'allowed-ips': list(aips)})
+        changed = True
+    elif list(found.get('allowed-ips') or []) != list(aips):
+        found['allowed-ips'] = list(aips)
+        changed = True
+elif action == 'remove':
+    if found is not None:
+        peers.remove(found)
+        changed = True
+else:
+    sys.exit('unknown action: ' + action)
+
+if peers:
+    tun['peers'] = peers
+else:
+    tun.pop('peers', None)
+
+if changed:
+    st = os.stat(path)
+    shutil.copy2(path, path + '.wg-admin.bak')
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.wg-admin.')
+    os.close(fd)
+    try:
+        with open(tmp, 'w') as fh:
+            yaml.safe_dump(quote_values(data), fh, default_flow_style=False,
+                           sort_keys=False, width=10000, allow_unicode=True)
+        with open(tmp) as fh:            # never install a file we cannot re-read
+            check = yaml.safe_load(fh)
+        assert check['network']['tunnels'][ifname]['mode'] == 'wireguard'
+        os.chmod(tmp, st.st_mode & 0o7777)
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+print('changed' if changed else 'unchanged')
+PY
+}
+
+# Persist a peer; sets NEEDS_APPLY when the on-disk config actually changed.
+persist_peer() {
+    local action="$1" pub="$2" aips="${3:-}"
+    local np res
+    np="$(netplan_file)" || {
+        err "no netplan file defines tunnel ${WG_IF}; live change applied but NOT persisted"
+        return 1
+    }
+    res="$(netplan_peer "$np" "$action" "$pub" "$aips")" || {
+        err "failed to update ${np}"
+        return 1
+    }
+    if [[ "$res" == "changed" ]]; then NEEDS_APPLY="true"; fi
+    return 0
+}
+
+# ------------------------------------------------------------ IP allocation --
+
+# Every host octet currently spoken for: the hard reservations, live wg peers,
+# and anything already handed out to a client.
+used_octets() {
+    local o d ip line a
+    for o in "${RESERVED_OCTETS[@]}"; do echo "$o"; done
+    while read -r line; do
+        for a in $(tr ',' ' ' <<<"$line"); do
+            if [[ "$a" =~ ^${TUNNEL_PREFIX//./\\.}\.([0-9]{1,3})/32$ ]]; then
+                echo "${BASH_REMATCH[1]}"
+            fi
+        done
+    done < <(wg show "$WG_IF" allowed-ips 2>/dev/null | cut -f2- || true)
+    for d in "$CLIENTS_DIR"/*/; do
+        [[ -f "${d}ip" ]] || continue
+        ip="$(<"${d}ip")"
+        if [[ "$ip" =~ ^${TUNNEL_PREFIX//./\\.}\.([0-9]{1,3})$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+        fi
+    done
+    # ipam reservations and scan observations hold their octet too, so that
+    # allocation skips them (CONTRACT.md v2: "reserved and observed IPs are
+    # skipped"). An absent ipam.json contributes nothing, which keeps the v1
+    # allocation behaviour bit-for-bit.
+    local ipam_f
+    if ipam_f="$(ipam_file)" && [[ -r "$ipam_f" ]]; then
+        jq -r --arg p "${TUNNEL_PREFIX}." '
+            (.reserved[]?, .observed[]?) | .ip // empty
+            | select(startswith($p)) | split(".") | .[3]' "$ipam_f" 2>/dev/null || true
+    fi
+}
+
+# Note: the octet list is materialised before it is searched. Returning early
+# out of a `while read` fed by a process substitution would close the pipe under
+# the producer and make it die with EPIPE, which prints a "write error: Broken
+# pipe" on stderr - stderr from a root helper must stay clean.
+octet_free() {
+    local want="$1" used
+    used="$(used_octets)"
+    ! grep -qxF -- "$want" <<<"$used"
+}
+
+# Must be called with the allocation lock held.
+alloc_ip() {
+    local o used
+    used="$(used_octets)"
+    for (( o = TUNNEL_FIRST; o <= TUNNEL_LAST; o++ )); do
+        if ! grep -qxF -- "$o" <<<"$used"; then
+            printf '%s.%s' "$TUNNEL_PREFIX" "$o"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Race safety for address allocation and for every mutation, per CONTRACT.md's
+# "every mutation is idempotent and re-runnable".
+with_lock() {
+    mkdir -p "$STATE_DIR"
+    chmod 0700 "$STATE_DIR"
+    exec 9>"$LOCK_FILE"
+    chmod 0600 "$LOCK_FILE" 2>/dev/null || true
+    flock -w 15 9 || die "could not acquire ${LOCK_FILE} within 15s"
+}
+
+# --------------------------------------------------------------- IPAM state --
+
+# Resolve the ipam state file. WG_ADMIN_IPAM_FILE is honoured ONLY when its
+# parent directory is /etc/wireguard, OR when WG_ADMIN_TEST_MODE=1 is also set.
+# The test gate exists so exhaustion/LRU paths can be exercised against a
+# throwaway file without touching the real pool state:
+#
+#   WG_ADMIN_TEST_MODE=1 WG_ADMIN_IPAM_FILE=/tmp/x/ipam.json wg-admin ipam-status
+#
+# Anything else is refused - a root helper must not be steerable into reading
+# or writing an arbitrary path via the environment.
+ipam_file() {
+    local f="${WG_ADMIN_IPAM_FILE:-}" parent
+    if [[ -z "$f" ]]; then printf '%s' "$IPAM_FILE_DEFAULT"; return 0; fi
+    parent="${f%/*}"
+    if [[ "$parent" == "$STATE_DIR" || "${WG_ADMIN_TEST_MODE:-0}" == "1" ]]; then
+        printf '%s' "$f"
+        return 0
+    fi
+    bail "WG_ADMIN_IPAM_FILE=${f} refused: parent must be ${STATE_DIR} (or set WG_ADMIN_TEST_MODE=1 for a throwaway test file)"
+}
+
+# Prints the state document; a missing file is an empty document, a corrupt
+# file is an error (never silently reset - it holds reservations).
+ipam_load() {
+    local f
+    f="$(ipam_file)" || return 1
+    if [[ ! -e "$f" ]]; then
+        printf '{"version":1,"reserved":[],"observed":[]}'
+        return 0
+    fi
+    jq -ce '(.reserved | type == "array") and (.observed | type == "array")' \
+        "$f" >/dev/null 2>&1 || bail "corrupt ipam state: $f"
+    cat "$f"
+}
+
+# Reads the new state document on stdin; writes it atomically, 0600 root:root.
+ipam_save() {
+    local f tmp
+    f="$(ipam_file)" || return 1
+    tmp="$(mktemp "${f}.XXXXXX")" || return 1
+    if ! jq -c '.' > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+    chmod 0600 "$tmp"
+    chown root:root "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$f"
+}
+
+ipam_net_ok() {
+    local n
+    for n in "${IPAM_NETS[@]}"; do
+        if [[ "$n" == "$1" ]]; then return 0; fi
+    done
+    return 1
+}
+
+# First three octets of a /24 pool ("172.16.4"), the shape every scannable
+# catalogue subnet has.
+pool_prefix() {
+    local cidr
+    cidr="$(net_cidr "$1")" || return 1
+    [[ "$cidr" == *.0/24 ]] || return 1
+    printf '%s' "${cidr%.0/24}"
+}
+
+# Which managed pool an address belongs to, if any (reservations only).
+pool_for_ip() {
+    local addr="$1" n p
+    for n in tunnel lab static-edt lan edy-lab; do
+        p="$(pool_prefix "$n")" || continue
+        if [[ "$addr" == "$p".* ]]; then printf '%s' "$n"; return 0; fi
+    done
+    return 1
+}
+
+# "ip mac" lines for the pool from the kernel neighbour table. FAILED and
+# INCOMPLETE entries carry no usable identity and are skipped.
+neigh_map() {
+    local prefix="$1"
+    # index()==1 rather than a regex: awk -v mangles backslash escapes, so a
+    # dot-escaped pattern would arrive warned-about and unescaped.
+    ip -4 neigh show 2>/dev/null | awk -v p="${prefix}." '
+        index($1, p) == 1 {
+            mac = ""
+            for (i = 1; i < NF; i++) if ($i == "lladdr") mac = $(i + 1)
+            if (mac != "" && $NF != "FAILED" && $NF != "INCOMPLETE") print $1, mac
+        }' || true
+    return 0
+}
+
+# "ip pubkey epoch" for every wg peer /32 inside the pool. Peers are L3 - they
+# have NO MAC; per CONTRACT.md the public key is the identity, and last_seen
+# comes from the latest handshake (epoch 0 = never).
+wg_peer_rows() {
+    local prefix="$1" pub rest a hs
+    local -A HS=()
+    while IFS=$'\t' read -r pub hs; do
+        [[ -n "$pub" ]] && HS["$pub"]="$hs"
+    done < <(wg show "$WG_IF" latest-handshakes 2>/dev/null || true)
+    while IFS=$'\t' read -r pub rest; do
+        [[ -n "$pub" ]] || continue
+        for a in $rest; do
+            if [[ "$a" =~ ^(${prefix//./\\.}\.[0-9]{1,3})/32$ ]]; then
+                printf '%s %s %s\n' "${BASH_REMATCH[1]}" "$pub" "${HS[$pub]:-0}"
+            fi
+        done
+    done < <(wg show "$WG_IF" allowed-ips 2>/dev/null || true)
+    return 0
+}
+
+# Every address the client store has handed out (tunnel pool).
+client_store_ips() {
+    local d
+    for d in "$CLIENTS_DIR"/*/; do
+        [[ -f "${d}ip" ]] || continue
+        cat "${d}ip"
+    done
+    return 0
+}
+
+# Everything that makes an address NOT free in <net>, one IP per line.
+#   mode "state": ipam-status view - historical observations also count, per
+#                 CONTRACT.md ("reserved and observed IPs are skipped").
+#   mode "live":  ipam-scan view - reserved / alive / neighbour / wg peer only.
+# Both additionally exclude the hard reservations and the client store on the
+# tunnel pool - handing those out could never be right.
+pool_taken() {
+    local net="$1" mode="$2" alive_file="${3:-}" prefix state o
+    prefix="$(pool_prefix "$net")" || return 1
+    state="$(ipam_load)" || return 1
+    jq -r --arg p "$prefix." \
+        '.reserved[]?.ip // empty | select(startswith($p))' <<<"$state"
+    if [[ "$mode" == "state" ]]; then
+        jq -r --arg p "$prefix." \
+            '.observed[]?.ip // empty | select(startswith($p))' <<<"$state"
+    fi
+    neigh_map "$prefix" | awk '{print $1}'
+    wg_peer_rows "$prefix" | awk '{print $1}'
+    if [[ -n "$alive_file" && -s "$alive_file" ]]; then
+        awk '{print $1}' "$alive_file"
+    fi
+    if [[ "$net" == "tunnel" ]]; then
+        for o in "${RESERVED_OCTETS[@]}"; do printf '%s.%s\n' "$prefix" "$o"; done
+        client_store_ips
+    fi
+    return 0
+}
+
+# stdin: taken IPs, one per line. Prints the free addresses in pool order.
+pool_free() {
+    awk -v p="$1" -v f="$IPAM_HOST_FIRST" -v l="$IPAM_HOST_LAST" '
+        { taken[$1] = 1 }
+        END { for (o = f; o <= l; o++) { ip = p "." o; if (!(ip in taken)) print ip } }'
+}
+
+# Parallel liveness sweep of <prefix>.2-254; emits "ip rtt_ms" per alive host.
+# fping when installed, else bounded background ping jobs - 1s/host timeout,
+# well inside the <=2s/host budget in CONTRACT.md.
+ipam_sweep() {
+    local prefix="$1" o addr out jobs=0
+    if command -v fping >/dev/null 2>&1; then
+        local -a ips=()
+        for (( o = IPAM_HOST_FIRST; o <= IPAM_HOST_LAST; o++ )); do
+            ips+=("${prefix}.${o}")
+        done
+        # -c1 one probe per target, -t1000 1s timeout; the stats go to stderr
+        # and only alive targets get a min/avg/max clause.
+        fping -c1 -t1000 -q "${ips[@]}" 2>&1 | awk '
+            /min\/avg\/max/ { n = split($NF, a, "/"); if (n == 3) print $1, a[2] }' || true
+        return 0
+    fi
+    out="$(mktemp)" || return 1
+    for (( o = IPAM_HOST_FIRST; o <= IPAM_HOST_LAST; o++ )); do
+        addr="${prefix}.${o}"
+        (
+            r="$(ping -n -c1 -W1 "$addr" 2>/dev/null \
+                 | sed -n -E 's/.*time=([0-9.]+) ms.*/\1/p' | head -n1)"
+            # one printf per result: O_APPEND + short line = atomic write
+            if [[ -n "$r" ]]; then printf '%s %s\n' "$addr" "$r" >> "$out"; fi
+            exit 0
+        ) &
+        jobs=$((jobs + 1))
+        if (( jobs >= IPAM_SCAN_CONCURRENCY )); then
+            wait -n || true
+            jobs=$((jobs - 1))
+        fi
+    done
+    wait || true
+    cat "$out"
+    rm -f "$out"
+    return 0
+}
+
+# The least-recently-seen observed tunnel IP that is SAFE to reuse when the
+# pool is exhausted. Never a reservation, never a hard-reserved octet, never
+# an existing client address, never an address a live wg peer holds - reusing
+# any of those would knock a real device (the ELT peer above all) off the air.
+# Prints "ip<TAB>last_seen<TAB>source"; empty when there is no candidate.
+ipam_lru_candidate() {
+    local state exclude o
+    state="$(ipam_load)" || return 1
+    exclude="$( {
+        jq -r --arg p "${TUNNEL_PREFIX}." \
+            '.reserved[]?.ip // empty | select(startswith($p))' <<<"$state"
+        for o in "${RESERVED_OCTETS[@]}"; do printf '%s.%s\n' "$TUNNEL_PREFIX" "$o"; done
+        client_store_ips
+        wg_peer_rows "$TUNNEL_PREFIX" | awk '{print $1}'
+    } | jq -Rnc '[inputs]')"
+    jq -r --arg p "${TUNNEL_PREFIX}." --argjson ex "$exclude" '
+        [.observed[]? | select((.ip | startswith($p)) and (([.ip] | inside($ex)) | not))]
+        | sort_by(.last_seen // "")
+        | if length == 0 then empty
+          else .[0] | [.ip, (.last_seen // ""), (.source // "")] | @tsv end' <<<"$state"
+    return 0
+}
+
+# ------------------------------------------------------------ client storage --
+
+client_dir() { printf '%s/%s' "$CLIENTS_DIR" "$1"; }
+cfg_path()   { printf '%s/%s/cfg-%s.conf' "$CLIENTS_DIR" "$1" "$2"; }
+
+client_exists() { [[ -d "$(client_dir "$1")" ]]; }
+
+client_configs() {
+    local d f b
+    d="$(client_dir "$1")"
+    for f in "$d"/cfg-*.conf; do
+        b="${f##*/}"; b="${b#cfg-}"; b="${b%.conf}"
+        printf '%s\n' "$b"
+    done
+}
+
+# Idempotent: an existing client keeps its keys and its address.
+# The third argument is "force" ONLY on the LRU-reuse path: the address was
+# vetted by ipam_lru_candidate, and octet_free would (correctly) veto it
+# because the observed entry is exactly what makes it the reuse candidate.
+create_client() {
+    local name="$1" want_ip="${2:-}" force="${3:-}" d ip o
+    d="$(client_dir "$name")"
+
+    if [[ -d "$d" ]]; then
+        [[ -s "$d/publickey" && -s "$d/privatekey" && -s "$d/ip" ]] \
+            || die "client '$name' exists but is incomplete; del-client it and retry"
+        return 0
+    fi
+
+    if [[ -n "$want_ip" ]]; then
+        valid_ipv4 "$want_ip" || die "not an IPv4 address: $want_ip"
+        [[ "$want_ip" == "$TUNNEL_PREFIX".* ]] \
+            || die "address $want_ip is outside ${TUNNEL_CIDR}"
+        o="${want_ip##*.}"
+        if [[ "$force" != "force" ]]; then
+            octet_free "$o" || die "address $want_ip is already in use or reserved"
+        fi
+        ip="$want_ip"
+    else
+        ip="$(alloc_ip)" || die "no free address left in ${TUNNEL_CIDR}"
+    fi
+
+    mkdir -p "$CLIENTS_DIR"
+    chmod 0700 "$STATE_DIR" "$CLIENTS_DIR"
+    mkdir -m 0700 "$d"
+    (
+        umask 077
+        wg genkey > "$d/privatekey"
+        wg pubkey < "$d/privatekey" > "$d/publickey"
+    )
+    chmod 0600 "$d/privatekey"
+    chmod 0644 "$d/publickey"
+    printf '%s\n' "$ip" > "$d/ip"
+    chmod 0644 "$d/ip"
+    chown -R root:root "$d"
+}
+
+# ------------------------------------------------------------ NAT / routing --
+
+comment_args() { printf -- '-m comment --comment wg-admin:%s' "$1"; }
+
+# rules_for <dest-id>
+# Emits "TABLE|CHAIN|CANONICAL_ARGS|ALTERNATE_ARGS" lines. ALTERNATE is a second
+# accepted spelling - notably the non-stateful reverse FORWARD rule that
+# wg-lan-nat.service already installs for br-static-edt. Destinations that
+# egress on wg0 itself need no NAT and emit nothing.
+# Returns 2 when the host has no route to the destination.
+rules_for() {
+    local id="$1" cidr iface
+    cidr="$(net_cidr "$id")" || return 1
+    iface="$(iface_for_cidr "$cidr")"
+    [[ -n "$iface" ]] || return 2
+    if [[ "$iface" == "$WG_IF" ]]; then return 0; fi
+
+    if [[ "$cidr" == "0.0.0.0/0" ]]; then
+        printf 'nat|POSTROUTING|-s %s ! -d %s -o %s -j MASQUERADE|\n' \
+            "$TUNNEL_CIDR" "$TUNNEL_CIDR" "$iface"
+    else
+        printf 'nat|POSTROUTING|-s %s -d %s -o %s -j MASQUERADE|\n' \
+            "$TUNNEL_CIDR" "$cidr" "$iface"
+    fi
+    printf 'filter|FORWARD|-i %s -o %s -j ACCEPT|\n' "$WG_IF" "$iface"
+    printf 'filter|FORWARD|-i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT|-i %s -o %s -j ACCEPT\n' \
+        "$iface" "$WG_IF" "$iface" "$WG_IF"
+    return 0
+}
+
+# True when the rule exists in ANY accepted spelling, whoever owns it. This is
+# how we cooperate with wg-lan-nat.service instead of duplicating its rules.
+# Picks the iptables verb for a table/chain.
+#
+# FORWARD rules must be INSERTED AT THE TOP, never appended. libvirt jumps to
+# LIBVIRT_FWI from FORWARD, and that chain REJECTs anything egressing virbr-edy
+# that is not already RELATED,ESTABLISHED. An appended ACCEPT lands AFTER that
+# jump, so a new connection from a tunnel client is rejected before it is ever
+# reached -- while `iptables -C` still reports the rule present, making the
+# panel toggle read ON while traffic is silently dropped.
+#
+# wg-lan-nat.service, which this tool extends, already uses `-I FORWARD 1/2` for
+# exactly this reason; using -A here was a divergence from that precedent.
+#
+# nat/POSTROUTING is unaffected: LIBVIRT_PRT only matches -s 172.20.10.0/24 and
+# -s 192.168.122.0/24, so an appended MASQUERADE is still reached.
+add_op() {
+    case "$1/$2" in
+        filter/FORWARD) printf -- '-I FORWARD 1' ;;
+        *)              printf -- '-A %s' "$2" ;;
+    esac
+}
+
+rule_present() {
+    local table="$1" chain="$2" canon="$3" alt="$4" dest="$5" cmt s
+    cmt="$(comment_args "$dest")"
+    local -a spellings=("$canon" "$canon $cmt")
+    if [[ -n "$alt" ]]; then spellings+=("$alt" "$alt $cmt"); fi
+    for s in "${spellings[@]}"; do
+        # word splitting on $s is intentional: it is an iptables argument list
+        # shellcheck disable=SC2086
+        if iptables -t "$table" -C "$chain" $s >/dev/null 2>&1; then return 0; fi
+    done
+    return 1
+}
+
+# Emits one JSON object for a destination. It builds the JSON here rather than
+# passing tab-separated fields to a `read`: a destination with no route has an
+# empty iface field, and because TAB is IFS whitespace, `read` would collapse
+# the empty field and shift every column left.
+routing_dest_json() {
+    local id="$1" managed="$2" cidr iface present="true"
+    local table chain canon alt
+    cidr="$(net_cidr "$id")"
+    iface="$(iface_for_cidr "$cidr")"
+    if [[ -n "$iface" ]]; then
+        # A destination that egresses on wg0 itself needs no NAT: rules_for
+        # emits nothing and present stays true.
+        while IFS='|' read -r table chain canon alt; do
+            [[ -n "$table" ]] || continue
+            if ! rule_present "$table" "$chain" "$canon" "$alt" "$id"; then present="false"; fi
+        done < <(rules_for "$id" || true)
+    else
+        present="false"
+    fi
+    jq -nc --arg dest "$id" --arg cidr "$cidr" --arg iface "$iface" \
+           --argjson present "$present" --argjson managed "$managed" \
+        '{dest: $dest, cidr: $cidr, iface: $iface, present: $present,
+          wg_admin_managed: $managed}'
+}
+
+routes_state_read() {
+    [[ -f "$ROUTES_STATE" ]] || return 0
+    grep -vE '^[[:space:]]*(#|$)' "$ROUTES_STATE" 2>/dev/null || true
+}
+
+routes_state_write() {
+    local tmp
+    mkdir -p "$STATE_DIR"
+    tmp="$(mktemp "${ROUTES_STATE}.XXXXXX")"
+    { printf '%s\n' "$@" | grep -vE '^[[:space:]]*$' | sort -u > "$tmp"; } || true
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$ROUTES_STATE"
+}
+
+# Regenerate the systemd drop-in so wg-admin's rules are reinstalled at boot by
+# the SAME unit that owns the base rules. A drop-in that adds ExecStart= lines
+# WITHOUT an empty reset appends to a Type=oneshot unit's command list, so this
+# extends wg-lan-nat.service rather than replacing or fighting it. The unit is
+# not restarted here - the live rules were already applied by routing-set, and
+# a restart would run the base unit's ExecStop.
+write_nat_dropin() {
+    local dest table chain canon alt cmt tmp g
+    mkdir -p "$NAT_DROPIN_DIR"
+    tmp="$(mktemp "${NAT_DROPIN}.XXXXXX")"
+    {
+        echo "# Managed by wg-admin - do not edit by hand."
+        echo "#"
+        echo "# Extends ${NAT_UNIT} with the masquerade/forward rules for the"
+        echo "# destinations enabled through 'wg-admin routing-set <dest> on'."
+        echo "# Adding ExecStart= lines in a drop-in APPENDS to this oneshot"
+        echo "# unit's command list, so the base unit's own rules are untouched."
+        echo "# Every rule below carries the iptables comment 'wg-admin:<dest>',"
+        echo "# which is also the only thing 'routing-set <dest> off' deletes."
+        echo
+        echo "[Service]"
+        while read -r dest; do
+            [[ -n "$dest" ]] || continue
+            net_cidr "$dest" >/dev/null 2>&1 || continue
+            cmt="$(comment_args "$dest")"
+            while IFS='|' read -r table chain canon alt; do
+                [[ -n "$table" ]] || continue
+                # The guard must test every accepted spelling, exactly like
+                # rule_present() does at runtime. Testing only the commented
+                # form would re-add a rule the base unit had already installed
+                # uncommented, quietly duplicating it on every boot.
+                g="iptables -t ${table} -C ${chain} ${canon} 2>/dev/null"
+                if [[ -n "$alt" ]]; then
+                    g="${g} || iptables -t ${table} -C ${chain} ${alt} 2>/dev/null"
+                fi
+                g="${g} || iptables -t ${table} -C ${chain} ${canon} ${cmt} 2>/dev/null"
+                if [[ -n "$alt" ]]; then
+                    g="${g} || iptables -t ${table} -C ${chain} ${alt} ${cmt} 2>/dev/null"
+                fi
+                g="${g} || iptables -t ${table} $(add_op "$table" "$chain") ${canon} ${cmt}"
+                printf "ExecStart=/bin/sh -c '%s'\n" "$g"
+            done < <(rules_for "$dest" || true)
+        done < <(routes_state_read)
+    } > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$NAT_DROPIN"
+    systemctl daemon-reload >/dev/null 2>&1 || err "systemctl daemon-reload failed"
+}
+
+# ------------------------------------------------------------- conf building --
+
+build_conf() {
+    local name="$1" cfg="$2" allowed="$3" mtu="$4" ka="$5" dns="$6"
+    local d ip priv spub ep epline out
+    d="$(client_dir "$name")"
+    ip="$(<"$d/ip")"
+    priv="$(<"$d/privatekey")"
+    spub="$(server_pubkey)" || die "cannot read ${WG_IF} public key"
+    [[ -n "$spub" ]] || die "cannot read ${WG_IF} public key"
+
+    # build_conf runs in the caller's shell, so these globals DO propagate up to
+    # verb_add_config, which reports them in its JSON result.
+    epline="$(resolve_endpoint)" || die "could not resolve the client endpoint"
+    ep="$(cut -f1 <<<"$epline")"
+    EP_PLACEHOLDER="$(cut -f2 <<<"$epline")"
+    EP_PORT="$(cut -f3 <<<"$epline")"
+    EP_ENDPOINT="$ep"
+    out="$(cfg_path "$name" "$cfg")"
+
+    (
+        umask 077
+        {
+            echo "# WireGuard client config generated by wg-admin ${VERSION}"
+            echo "# client: ${name}   config: ${cfg}   server interface: ${WG_IF}"
+            if [[ "$EP_PLACEHOLDER" == "true" ]]; then
+                echo "#"
+                echo "# !! The public endpoint could not be discovered automatically."
+                echo "# !! Replace ${ENDPOINT_PLACEHOLDER} below with this host's"
+                echo "# !! reachable public address, or set ENDPOINT= in ${CONF_FILE}."
+                echo "# !! The port (${EP_PORT}) is already correct - keep it."
+            fi
+            echo
+            echo "[Interface]"
+            echo "PrivateKey = ${priv}"
+            echo "Address = ${ip}/32"
+            echo "DNS = ${dns}"
+            echo "MTU = ${mtu}"
+            echo
+            echo "[Peer]"
+            echo "PublicKey = ${spub}"
+            echo "# Port ${EP_PORT} is the PUBLIC port clients dial; wg0 listens"
+            echo "# locally on $(server_port) and the router translates between them."
+            echo "Endpoint = ${ep}"
+            echo "# AllowedIPs here = the destinations this client routes INTO the"
+            echo "# tunnel. The matching server-side peer entry is ${ip}/32 ONLY."
+            echo "AllowedIPs = ${allowed}"
+            echo "PersistentKeepalive = ${ka}"
+        } > "$out"
+    )
+    chmod 0600 "$out"
+}
+
+ensure_qrencode() {
+    if command -v qrencode >/dev/null 2>&1; then return 0; fi
+    err "qrencode not installed; installing it now"
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode >&2; then
+        :
+    elif apt-get update >&2 && DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode >&2; then
+        :
+    else
+        die "could not install qrencode"
+    fi
+    command -v qrencode >/dev/null 2>&1 || die "qrencode still unavailable after install"
+}
+
+# ------------------------------------------------------------------- verbs --
+
+verb_catalogue() {
+    local networks presets="{}" p id
+    networks="$( { while read -r id; do
+            jq -nc --arg id "$id" --arg cidr "$(net_cidr "$id")" \
+                   --arg description "$(net_desc "$id")" \
+                   '{id: $id, cidr: $cidr, description: $description}'
+        done < <(net_ids); } | jq -sc '.' )"
+    while read -r p; do
+        presets="$(jq -nc --argjson acc "$presets" --arg k "$p" \
+            --argjson v "$(preset_routes "$p" | jq -Rc 'split(",")')" \
+            '$acc + {($k): $v}')"
+    done < <(preset_ids)
+
+    # ip_forward is published LAST and with an empty cidr. It is not a routable
+    # destination - it is here only so the UI can address it with routing-set
+    # (the panel gates its toggle on the id being present in the catalogue).
+    # resolve_routes() rejects it, so it can never reach a client conf.
+    networks="$(jq -nc --argjson n "$networks" --arg id "$SETTING_IP_FORWARD" \
+        '$n + [{id: $id, cidr: "",
+                description: "host setting, not a route - net.ipv4.ip_forward; toggle with routing-set"}]')"
+
+    jq -nc --argjson networks "$networks" --argjson presets "$presets" \
+           --argjson ports "$(port_facts_json)" \
+        '{networks: $networks, presets: $presets, ports: $ports}'
+}
+
+verb_list() {
+    local d name ip pub cfgjson enabled
+    { for d in "$CLIENTS_DIR"/*/; do
+        name="${d%/}"; name="${name##*/}"
+        ip=""; if [[ -f "${d}ip" ]]; then ip="$(<"${d}ip")"; fi
+        pub=""; if [[ -f "${d}publickey" ]]; then pub="$(<"${d}publickey")"; fi
+        cfgjson="$(client_configs "$name" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+        if [[ -n "$pub" ]] && peer_present "$pub"; then enabled=true; else enabled=false; fi
+        jq -nc --arg name "$name" --arg ip "$ip" --argjson configs "$cfgjson" \
+               --argjson enabled "$enabled" \
+               '{name: $name, ip: $ip, configs: $configs, enabled: $enabled}'
+      done; } | jq -sc '{clients: .}'
+}
+
+verb_new_client() {
+    local want_ip="" d
+    local -a pos=()
+    while (($#)); do
+        case "$1" in
+            --ip) want_ip="${2:-}"; shift 2 ;;
+            --)   shift ;;
+            -*)   die "new-client: unknown option: $1" ;;
+            *)    pos+=("$1"); shift ;;
+        esac
+    done
+    local name="${pos[0]:-}"
+    [[ -n "$name" ]] || die "new-client: NAME is required"
+    valid_name "$name" || die "invalid client name: $name"
+
+    with_lock
+
+    # Exhaustion path (CONTRACT.md v2): when nothing is free, hand out the
+    # least-recently-seen SAFE observed address - with reused:true and a
+    # warning the UI must render. Never silently.
+    local reused=false warning="" force="" probe cand c_ip c_seen c_src
+    if [[ -z "$want_ip" ]] && ! client_exists "$name"; then
+        if ! probe="$(alloc_ip)"; then
+            cand="$(ipam_lru_candidate)" || cand=""
+            [[ -n "$cand" ]] || die "no free address left in ${TUNNEL_CIDR} and no safely reusable observed address"
+            IFS=$'\t' read -r c_ip c_seen c_src <<<"$cand"
+            want_ip="$c_ip"; force="force"; reused=true
+            warning="address pool ${TUNNEL_CIDR} is exhausted; reusing ${c_ip}, the least recently seen address${c_seen:+ (last seen ${c_seen}${c_src:+ via ${c_src}})}. Verify that device is really gone before this client connects."
+            err "POOL EXHAUSTED: reusing ${c_ip} for client ${name}"
+        fi
+    fi
+
+    create_client "$name" "$want_ip" "$force"
+    d="$(client_dir "$name")"
+    if [[ "$reused" == "true" ]]; then
+        jq -nc --arg name "$name" --arg ip "$(<"$d/ip")" --arg pubkey "$(<"$d/publickey")" \
+               --arg warning "$warning" \
+            '{name: $name, ip: $ip, pubkey: $pubkey, reused: true, warning: $warning}'
+    else
+        jq -nc --arg name "$name" --arg ip "$(<"$d/ip")" --arg pubkey "$(<"$d/publickey")" \
+            '{name: $name, ip: $ip, pubkey: $pubkey}'
+    fi
+}
+
+verb_add_config() {
+    local routes="" preset="" rlist allowed d pub ip server_aips persisted="true"
+    local mtu_opt="" ka_opt="" dns_opt="" mtu ka dns pp
+    local -a pos=() cidrs=()
+    while (($#)); do
+        case "$1" in
+            --routes)    routes="${2:-}";  shift 2 ;;
+            --preset)    preset="${2:-}";  shift 2 ;;
+            --mtu)       mtu_opt="${2:-}"; shift 2 ;;
+            --keepalive) ka_opt="${2:-}";  shift 2 ;;
+            --dns)       dns_opt="${2:-}"; shift 2 ;;
+            --)          shift ;;
+            -*)          die "add-config: unknown option: $1" ;;
+            *)           pos+=("$1"); shift ;;
+        esac
+    done
+    local name="${pos[0]:-}" cfg="${pos[1]:-}"
+    [[ -n "$name" && -n "$cfg" ]] || die "add-config: NAME and CFG are required"
+    valid_name "$name" || die "invalid client name: $name"
+    valid_name "$cfg"  || die "invalid config name: $cfg"
+    if [[ -n "$preset" && -z "$routes" ]]; then
+        routes="$(preset_routes "$preset")" || die "unknown preset: $preset"
+    fi
+    [[ -n "$routes" ]] || die "add-config: --routes (or --preset) is required"
+
+    # Resolve the tunables (flag > wg-admin.conf > built-in default), then
+    # validate the EFFECTIVE value. Validating only the flag would let a bad
+    # MTU= in wg-admin.conf write a broken conf.
+    mtu="${mtu_opt:-$(conf_get MTU "$DEFAULT_MTU")}"
+    ka="${ka_opt:-$(conf_get KEEPALIVE "$DEFAULT_KEEPALIVE")}"
+    dns="${dns_opt:-$(detect_dns)}"
+
+    [[ "$mtu" =~ ^[0-9]+$ ]] && (( 10#$mtu >= MTU_MIN && 10#$mtu <= MTU_MAX )) \
+        || die "--mtu must be an integer ${MTU_MIN}-${MTU_MAX} (got: $mtu)"
+    [[ "$ka" =~ ^[0-9]+$ ]] && (( 10#$ka >= 0 && 10#$ka <= 65535 )) \
+        || die "--keepalive must be an integer 0-65535 (got: $ka)"
+    valid_ipv4 "$dns" || die "--dns must be a valid IPv4 address (got: $dns)"
+
+    # Checked here as well as in public_port() so the UI gets a JSON error that
+    # names the offending key, rather than a generic endpoint failure.
+    pp="$(conf_get PUBLIC_PORT "")"
+    if [[ -n "$pp" ]]; then
+        valid_port "$pp" || die "PUBLIC_PORT in ${CONF_FILE} is not a valid port: $pp"
+    fi
+
+    with_lock
+    client_exists "$name" || die "no such client: $name (run new-client first)"
+
+    rlist="$(resolve_routes "$routes")" || die "could not resolve --routes '$routes'"
+    mapfile -t cidrs <<<"$rlist"
+    ((${#cidrs[@]})) || die "route selection resolved to nothing"
+    allowed="$(printf '%s\n' "${cidrs[@]}" | paste -sd',' - | sed 's/,/, /g')"
+
+    d="$(client_dir "$name")"
+    pub="$(<"$d/publickey")"
+    ip="$(<"$d/ip")"
+
+    build_conf "$name" "$cfg" "$allowed" "$mtu" "$ka" "$dns"
+    printf '%s\n' "$routes" > "$d/cfg-${cfg}.routes"
+    chmod 0644 "$d/cfg-${cfg}.routes"
+
+    # THE ASYMMETRY. The server peer gets the client /32 and nothing else.
+    # `wg set` is a live, surgical change: it touches only this peer, so the
+    # existing ELT peer and the running tunnel are unaffected.
+    server_aips="${ip}/32"
+    wg set "$WG_IF" peer "$pub" allowed-ips "$server_aips" \
+        || die "failed to apply peer to ${WG_IF}"
+
+    persist_peer add "$pub" "$server_aips" || persisted="false"
+
+    jq -nc --arg name "$name" --arg config "$cfg" --arg allowed_ips "$allowed" \
+           --arg path "$(cfg_path "$name" "$cfg")" \
+           --arg server_allowed_ips "$server_aips" \
+           --arg endpoint "$EP_ENDPOINT" \
+           --arg dns "$dns" \
+           --argjson public_port "$EP_PORT" \
+           --argjson mtu "$mtu" \
+           --argjson keepalive "$ka" \
+           --argjson ports "$(port_facts_json)" \
+           --argjson persisted "$persisted" \
+           --argjson needs_apply "$NEEDS_APPLY" \
+           --argjson endpoint_placeholder "$EP_PLACEHOLDER" \
+        '{name: $name, config: $config, allowed_ips: $allowed_ips, path: $path,
+          server_allowed_ips: $server_allowed_ips,
+          endpoint: $endpoint, public_port: $public_port,
+          mtu: $mtu, keepalive: $keepalive, dns: $dns,
+          ports: $ports, persisted: $persisted,
+          needs_apply: $needs_apply, endpoint_placeholder: $endpoint_placeholder}'
+}
+
+verb_get_config() {
+    local qr=0 p qrart="" placeholder=false ep="" pport=""
+    local -a pos=()
+    while (($#)); do
+        case "$1" in
+            --qr) qr=1; shift ;;
+            --)   shift ;;
+            -*)   die "get-config: unknown option: $1" ;;
+            *)    pos+=("$1"); shift ;;
+        esac
+    done
+    local name="${pos[0]:-}" cfg="${pos[1]:-}"
+    [[ -n "$name" && -n "$cfg" ]] || die "get-config: NAME and CFG are required"
+    valid_name "$name" || die "invalid client name: $name"
+    valid_name "$cfg"  || die "invalid config name: $cfg"
+
+    p="$(cfg_path "$name" "$cfg")"
+    [[ -f "$p" ]] || die "no such config: ${name}/${cfg}"
+
+    if (( qr )); then
+        ensure_qrencode
+        qrart="$(qrencode -t ansiutf8 < "$p")" || die "qrencode failed"
+    fi
+    if grep -qF -- "$ENDPOINT_PLACEHOLDER" "$p"; then placeholder=true; fi
+
+    # Report the endpoint as it was actually written, not as it would be
+    # recomputed now - the stored conf is what the client will dial.
+    ep="$(sed -n -E 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*(.*)$/\1/p' "$p" \
+          | head -n1)" || ep=""
+    pport="${ep##*:}"
+    if ! valid_port "$pport"; then pport=""; fi
+
+    # This is the ONLY place private key material is allowed to reach stdout.
+    jq -nc --rawfile conf "$p" --arg qr "$qrart" \
+           --arg endpoint "$ep" --arg pport "$pport" \
+           --argjson ports "$(port_facts_json)" \
+           --argjson endpoint_placeholder "$placeholder" \
+        '{conf: $conf, qr: $qr, endpoint: $endpoint,
+          public_port: (if $pport == "" then null else ($pport | tonumber) end),
+          ports: $ports, endpoint_placeholder: $endpoint_placeholder}'
+}
+
+verb_del_config() {
+    local d p
+    local -a pos=()
+    while (($#)); do
+        case "$1" in
+            --) shift ;;
+            -*) die "del-config: unknown option: $1" ;;
+            *)  pos+=("$1"); shift ;;
+        esac
+    done
+    local name="${pos[0]:-}" cfg="${pos[1]:-}"
+    [[ -n "$name" && -n "$cfg" ]] || die "del-config: NAME and CFG are required"
+    valid_name "$name" || die "invalid client name: $name"
+    valid_name "$cfg"  || die "invalid config name: $cfg"
+
+    with_lock
+    d="$(client_dir "$name")"
+    p="$(cfg_path "$name" "$cfg")"
+    if [[ -f "$p" ]]; then
+        shred -u "$p" 2>/dev/null || rm -f "$p"
+    fi
+    rm -f "$d/cfg-${cfg}.routes"
+    # The server peer belongs to the CLIENT, not to one config - a client may
+    # hold several configs against the same key. del-client removes the peer.
+    jq -nc '{ok: true}'
+}
+
+verb_del_client() {
+    local d pub persisted="true"
+    local -a pos=()
+    while (($#)); do
+        case "$1" in
+            --) shift ;;
+            -*) die "del-client: unknown option: $1" ;;
+            *)  pos+=("$1"); shift ;;
+        esac
+    done
+    local name="${pos[0]:-}"
+    [[ -n "$name" ]] || die "del-client: NAME is required"
+    valid_name "$name" || die "invalid client name: $name"
+
+    with_lock
+    d="$(client_dir "$name")"
+    if [[ ! -d "$d" ]]; then
+        jq -nc '{ok: true, persisted: true, needs_apply: false, note: "no such client"}'
+        return 0
+    fi
+    pub=""
+    if [[ -f "$d/publickey" ]]; then pub="$(<"$d/publickey")"; fi
+
+    if [[ -n "$pub" ]]; then
+        wg set "$WG_IF" peer "$pub" remove || err "wg set peer remove failed (continuing)"
+        persist_peer remove "$pub" || persisted="false"
+    fi
+
+    find "$d" -type f -exec shred -u {} + 2>/dev/null || true
+    rm -rf "$d"
+
+    jq -nc --argjson persisted "$persisted" --argjson needs_apply "$NEEDS_APPLY" \
+        '{ok: true, persisted: $persisted, needs_apply: $needs_apply}'
+}
+
+verb_routing_status() {
+    local ipf id managed e
+    local -a enabled=()
+    ipf="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)"
+    mapfile -t enabled < <(routes_state_read)
+    { while read -r id; do
+        managed=false
+        for e in ${enabled[@]+"${enabled[@]}"}; do
+            if [[ "$e" == "$id" ]]; then managed=true; fi
+        done
+        routing_dest_json "$id" "$managed"
+      done < <(net_ids); } \
+    | jq -sc --argjson ip_forward "$ipf" --argjson ports "$(port_facts_json)" \
+        '{ip_forward: $ip_forward, rules: ., ports: $ports}'
+}
+
+# Every file that sets net.ipv4.ip_forward, other than ours. Emits "file=value"
+# using the LAST assignment in each file, which is what sysctl itself honours.
+ipforward_sources() {
+    local f v
+    for f in /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf \
+             /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" == "$SYSCTL_DROPIN" ]] && continue
+        [[ "$f" == "$SYSCTL_DROPIN_OLD" ]] && continue
+        v="$(sed -n -E 's/^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*([0-9]+).*$/\1/p' \
+             "$f" 2>/dev/null | tail -n1)" || v=""
+        [[ -n "$v" ]] && printf '%s=%s\n' "$f" "$v"
+    done
+}
+
+# Byte-order string comparison. `[[` is a keyword, so it cannot take an
+# LC_ALL=C prefix the way a command can - the locale has to be set in scope.
+str_gt() { local LC_ALL=C; [[ "$1" > "$2" ]]; }
+
+# The highest-sorting OTHER source as "file=value", or "" when there is none.
+ipforward_top_other() {
+    local LC_ALL=C
+    local line f b best="" best_b=""
+    while read -r line; do
+        [[ -n "$line" ]] || continue
+        f="${line%=*}"; b="${f##*/}"
+        if [[ -z "$best_b" || "$b" > "$best_b" ]]; then best_b="$b"; best="$line"; fi
+    done < <(ipforward_sources)
+    printf '%s' "$best"
+}
+
+# routing-set ip_forward on|off - the sysctl, not an iptables rule.
+routing_set_ipforward() {
+    local mode="$1" want cur changed=false persist_changed=false
+    local other_agrees=false line src val existing=""
+    if [[ "$mode" == "on" ]]; then want=1; else want=0; fi
+
+    cur="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)"
+
+    # 1. runtime
+    if [[ "$cur" != "$want" ]]; then
+        sysctl -q -w "net.ipv4.ip_forward=${want}" \
+            || die "could not set net.ipv4.ip_forward=${want}"
+        changed=true
+    fi
+
+    # 2. persistence - do not add a competing entry if something else already
+    #    asserts the value we want.
+    while read -r line; do
+        [[ -n "$line" ]] || continue
+        src="${line%=*}"; val="${line##*=}"
+        if [[ "$val" == "$want" ]]; then other_agrees=true; fi
+        err "note: ${src} also sets net.ipv4.ip_forward=${val}"
+    done < <(ipforward_sources)
+
+    if [[ -f "$SYSCTL_DROPIN" ]]; then
+        existing="$(sed -n -E 's/^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*([0-9]+).*$/\1/p' \
+                    "$SYSCTL_DROPIN" 2>/dev/null | tail -n1)" || existing=""
+    fi
+
+    if [[ -f "$SYSCTL_DROPIN" ]]; then
+        # We already own a drop-in: keep it correct.
+        if [[ "$existing" != "$want" ]]; then
+            write_sysctl_dropin "$want"; persist_changed=true
+        fi
+    elif [[ "$other_agrees" == "true" ]]; then
+        : # someone else already persists this value; adding ours would compete
+    else
+        write_sysctl_dropin "$want"; persist_changed=true
+    fi
+
+    if [[ "$persist_changed" == "true" ]]; then changed=true; fi
+
+    # Would anything still override us at the next boot? Only a file whose
+    # basename sorts AFTER ours and asserts a different value can.
+    local overridden_by="" top tf tv tb ours_b
+    ours_b="${SYSCTL_DROPIN##*/}"
+    top="$(ipforward_top_other)"
+    if [[ -f "$SYSCTL_DROPIN" && -n "$top" ]]; then
+        tf="${top%=*}"; tv="${top##*=}"; tb="${tf##*/}"
+        if str_gt "$tb" "$ours_b" && [[ "$tv" != "$want" ]]; then
+            overridden_by="$tf"
+            err "WARNING: ${tf} sorts after ${ours_b} and sets ip_forward=${tv}; it will win at boot"
+        fi
+    fi
+
+    local persisted="false" persisted_by="external"
+    if [[ -f "$SYSCTL_DROPIN" ]]; then persisted="true"; persisted_by="$SYSCTL_DROPIN"; fi
+
+    jq -nc --argjson changed "$changed" --arg dest "$SETTING_IP_FORWARD" \
+           --argjson value "$want" --argjson runtime "$want" \
+           --argjson persisted "$persisted" --arg persisted_by "$persisted_by" \
+           --arg overridden_by "$overridden_by" \
+        '{ok: true, changed: $changed, dest: $dest, value: $value,
+          runtime: $runtime, persisted: $persisted, persisted_by: $persisted_by,
+          overridden_by: (if $overridden_by == "" then null else $overridden_by end)}'
+}
+
+write_sysctl_dropin() {
+    local want="$1" tmp
+    mkdir -p /etc/sysctl.d
+    # A drop-in under the previous, badly-sorting name would silently disagree.
+    rm -f "$SYSCTL_DROPIN_OLD"
+    tmp="$(mktemp "${SYSCTL_DROPIN}.XXXXXX")"
+    {
+        echo "# Managed by wg-admin - do not edit by hand."
+        echo "#"
+        echo "# Without IPv4 forwarding the WireGuard tunnel still comes up and the"
+        echo "# handshake still succeeds, but this host will not pass packets through"
+        echo "# it: clients reach wg0 and nothing behind it."
+        echo "#"
+        echo "# Named 99- so it sorts last and wins over any earlier drop-in."
+        echo "net.ipv4.ip_forward = ${want}"
+    } > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$SYSCTL_DROPIN"
+}
+
+verb_routing_set() {
+    local dest="${1:-}" mode="${2:-}"
+    local cidr iface changed=false table chain canon alt cmt s e found=0
+    local -a enabled=() keep=()
+    [[ -n "$dest" && -n "$mode" ]] || die "routing-set: DEST and on|off are required"
+    [[ "$mode" == "on" || "$mode" == "off" ]] || die "routing-set: mode must be on or off"
+
+    # ip_forward is a host switch, not a destination CIDR - handle it before the
+    # net_cidr lookup, which would otherwise reject it as an unknown destination.
+    if [[ "$dest" == "$SETTING_IP_FORWARD" ]]; then
+        with_lock
+        routing_set_ipforward "$mode"
+        return 0
+    fi
+
+    net_cidr "$dest" >/dev/null 2>&1 || die "unknown destination: $dest"
+
+    with_lock
+    cidr="$(net_cidr "$dest")"
+    iface="$(iface_for_cidr "$cidr")"
+    [[ -n "$iface" ]] || die "this host has no route to ${cidr} (dest ${dest})"
+
+    mapfile -t enabled < <(routes_state_read)
+    cmt="$(comment_args "$dest")"
+
+    if [[ "$mode" == "on" ]]; then
+        while IFS='|' read -r table chain canon alt; do
+            [[ -n "$table" ]] || continue
+            # COOPERATE: if wg-lan-nat.service (or anything else) already has an
+            # equivalent rule, leave it alone rather than adding a duplicate.
+            if rule_present "$table" "$chain" "$canon" "$alt" "$dest"; then continue; fi
+            # shellcheck disable=SC2086
+            iptables -t "$table" $(add_op "$table" "$chain") $canon $cmt \
+                || die "iptables add failed for dest $dest"
+            changed=true
+        done < <(rules_for "$dest" || true)
+        for e in ${enabled[@]+"${enabled[@]}"}; do
+            if [[ "$e" == "$dest" ]]; then found=1; fi
+        done
+        if (( ! found )); then enabled+=("$dest"); changed=true; fi
+        routes_state_write ${enabled[@]+"${enabled[@]}"}
+    else
+        # Only ever delete rules WE marked. wg-lan-nat.service's own rules keep
+        # the existing ELT peer working and must never be pulled out from here.
+        while IFS='|' read -r table chain canon alt; do
+            [[ -n "$table" ]] || continue
+            for s in "$canon $cmt" ${alt:+"${alt} ${cmt}"}; do
+                # shellcheck disable=SC2086
+                while iptables -t "$table" -C "$chain" $s >/dev/null 2>&1; do
+                    # shellcheck disable=SC2086
+                    iptables -t "$table" -D "$chain" $s || break
+                    changed=true
+                done
+            done
+        done < <(rules_for "$dest" || true)
+        for e in ${enabled[@]+"${enabled[@]}"}; do
+            if [[ "$e" != "$dest" ]]; then keep+=("$e"); else changed=true; fi
+        done
+        enabled=(${keep[@]+"${keep[@]}"})
+        routes_state_write ${enabled[@]+"${enabled[@]}"}
+    fi
+
+    write_nat_dropin
+
+    jq -nc --argjson changed "$changed" --arg dest "$dest" --arg iface "$iface" \
+        '{ok: true, changed: $changed, dest: $dest, iface: $iface}'
+}
+
+# ----------------------------------------------------------- schema (v2 UI) --
+
+# The UI renders NOTHING it invented: every control, bound, default and
+# recommendation comes from here. Defaults are resolved from wg-admin.conf at
+# emit time - never hardcoded twice. No network I/O happens here (schema is
+# fetched on every page load), which is why the endpoint field can read
+# "auto-discovered" instead of a curl result.
+verb_schema() {
+    local mtu_def ka_def dns_def ipf ports ep_conf ep_default pp
+
+    mtu_def="$(conf_get MTU "$DEFAULT_MTU")"
+    if ! [[ "$mtu_def" =~ ^[0-9]+$ ]] || (( 10#$mtu_def < MTU_MIN || 10#$mtu_def > MTU_MAX )); then
+        err "MTU in ${CONF_FILE} is invalid (${mtu_def}); schema falls back to ${DEFAULT_MTU}"
+        mtu_def="$DEFAULT_MTU"
+    fi
+    ka_def="$(conf_get KEEPALIVE "$DEFAULT_KEEPALIVE")"
+    if ! [[ "$ka_def" =~ ^[0-9]+$ ]] || (( 10#$ka_def > 65535 )); then
+        err "KEEPALIVE in ${CONF_FILE} is invalid (${ka_def}); schema falls back to ${DEFAULT_KEEPALIVE}"
+        ka_def="$DEFAULT_KEEPALIVE"
+    fi
+    dns_def="$(detect_dns)"
+    valid_ipv4 "$dns_def" || dns_def="$DEFAULT_DNS"
+    ipf="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)"
+    ports="$(port_facts_json)"
+
+    ep_conf="$(conf_get ENDPOINT "")"
+    if [[ -n "$ep_conf" && "$ep_conf" == *:* ]]; then
+        ep_default="$ep_conf"
+    elif [[ -n "$ep_conf" ]]; then
+        pp="$(public_port)" || pp=""
+        ep_default="${ep_conf}${pp:+:$pp}"
+    else
+        pp="$(public_port)" || pp=""
+        ep_default="auto-discovered at generation time${pp:+ (port $pp)}"
+    fi
+
+    local routes_opts id
+    routes_opts="$( { while read -r id; do
+            jq -nc --arg value "$id" --arg cidr "$(net_cidr "$id")" \
+                   --arg label "$id ($(net_cidr "$id"))" --arg help "$(net_desc "$id")" \
+                '{value: $value, label: $label, cidr: $cidr, help: $help}'
+        done < <(net_ids); } | jq -sc '.')"
+
+    local f_client
+    f_client="$( {
+        jq -nc '{id: "name", label: "Client name", control: "text",
+                 default: "", pattern: "^[a-z0-9-]{1,32}$",
+                 placeholder: "e.g. laptop-fred",
+                 help: "Short lowercase handle for the device; it names the key and config store under /etc/wireguard/clients/.",
+                 breaks_when_wrong: null, unit: null}'
+        jq -nc --arg cidr "$TUNNEL_CIDR" \
+                '{id: "ip", label: "Tunnel address", control: "select",
+                 default: "", options: [], source: "ipam-free",
+                 help: ("The client address inside " + $cidr + ". Options are populated client-side from the ipam-status free list; leave empty to auto-allocate the lowest free address."),
+                 breaks_when_wrong: "Two peers claiming the same address fight over cryptokey routing - the last to handshake wins and the other goes silently dark.",
+                 unit: null}'
+        jq -nc --argjson options "$routes_opts" \
+                '{id: "routes", label: "Destinations", control: "cidr-set",
+                 default: ["tunnel"], options: $options,
+                 help: "What the client routes into the tunnel (its [Peer] AllowedIPs). The server-side peer entry always gets the client /32 only - both ends are derived from this one selection.",
+                 breaks_when_wrong: "Destination subnets on the SERVER side make the server route those subnets to the client; overlapping peers silently fight and the last match wins.",
+                 unit: null}'
+        jq -nc --argjson default "$mtu_def" --argjson min "$MTU_MIN" --argjson max "$MTU_MAX" \
+                '{id: "mtu", label: "MTU", control: "number",
+                 default: $default, min: $min, max: $max, unit: "bytes",
+                 help: "Tunnel packet size. 1420 fits the WireGuard overhead inside a standard 1500-byte path.",
+                 breaks_when_wrong: "Too large and the handshake and ping still work, but TCP hangs on the first full-size frame."}'
+        jq -nc --argjson default "$ka_def" \
+                '{id: "keepalive", label: "Persistent keepalive", control: "number",
+                 default: $default, min: 0, max: 65535, unit: "seconds",
+                 help: "How often the client sends a keepalive to hold NAT state open; 0 disables.",
+                 breaks_when_wrong: "Behind NAT the mapping expires after ~2 minutes of silence and the tunnel goes one-way until the client next transmits."}'
+        jq -nc --arg default "$dns_def" \
+                '{id: "dns", label: "DNS server", control: "text",
+                 default: $default, pattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}$", unit: null,
+                 help: "Resolver written into the client config.",
+                 breaks_when_wrong: "Names stop resolving inside the tunnel while raw IPs still work."}'
+    } | jq -sc '.')"
+
+    local f_routing cidr iface present djson ipf_bool
+    if [[ "$ipf" == "1" ]]; then ipf_bool=true; else ipf_bool=false; fi
+    f_routing="$( {
+        jq -nc --argjson default "$ipf_bool" \
+            '{id: "ip_forward", label: "IPv4 forwarding (net.ipv4.ip_forward)",
+              control: "toggle", default: $default,
+              dest: "ip_forward", verb: "routing-set", unit: null,
+              help: "Master switch: whether this host forwards packets between interfaces at all.",
+              breaks_when_wrong: "The tunnel comes up and the handshake succeeds, but the server will not forward - clients reach wg0 and nothing behind it."}'
+        while read -r id; do
+            cidr="$(net_cidr "$id")"
+            iface="$(iface_for_cidr "$cidr")"
+            # Destinations that egress on wg0 itself (the tunnel range and
+            # anything routed through a peer) need no masquerade: no toggle.
+            if [[ "$iface" == "$WG_IF" ]]; then continue; fi
+            djson="$(routing_dest_json "$id" false)"
+            present="$(jq -r '.present' <<<"$djson")"
+            jq -nc --arg id "masq-${id}" --arg dest "$id" \
+                   --arg label "Masquerade to ${id} (${cidr}${iface:+ via ${iface}})" \
+                   --argjson default "$present" \
+                   --arg help "NAT tunnel sources ${TUNNEL_CIDR} towards ${cidr}: $(net_desc "$id")" \
+                '{id: $id, label: $label, control: "toggle", default: $default,
+                  dest: $dest, verb: "routing-set", unit: null, help: $help,
+                  breaks_when_wrong: "Packets reach the destination subnet but the replies have no route back to the tunnel range - connections just time out."}'
+        done < <(net_ids)
+    } | jq -sc '.')"
+
+    local f_server
+    f_server="$(jq -nc --argjson ports "$ports" --arg ep "$ep_default" '
+        [ {id: "listen_port", label: "Local listen port", control: "readonly",
+           default: $ports.listen_port, unit: null,
+           help: "UDP port wg0 binds on this host."},
+          {id: "public_port", label: "Public port", control: "readonly",
+           default: $ports.public_port, unit: null,
+           help: "The port remote clients must dial (PUBLIC_PORT in wg-admin.conf); the router forwards it to the local listen port."},
+          {id: "endpoint", label: "Endpoint", control: "readonly",
+           default: $ep, unit: null,
+           help: "Public host:port written into client configs; auto-discovered means the WAN address is looked up when each config is generated."},
+          {id: "port_forwarded", label: "Behind a port-forward", control: "readonly",
+           default: $ports.port_forwarded, unit: null,
+           help: "True when the public port differs from the local listen port, i.e. a router translates in front of this host."} ]')"
+
+    # Live iface names in the recommendation text, resolved the same way
+    # routing-set will resolve them.
+    local lan_if full_if lab_if
+    lan_if="$(iface_for_cidr "$(net_cidr lan)")";   [[ -n "$lan_if" ]]  || lan_if="the LAN interface"
+    full_if="$(iface_for_cidr 0.0.0.0/0)";          [[ -n "$full_if" ]] || full_if="the WAN interface"
+    lab_if="$(iface_for_cidr "$(net_cidr lab)")";   [[ -n "$lab_if" ]]  || lab_if="the lab interface"
+
+    local recos
+    recos="$(jq -nc --arg t "$TUNNEL_CIDR" \
+                   --arg lan_if "$lan_if" --arg full_if "$full_if" --arg lab_if "$lab_if" '
+        [ {id: "needs-nat-lan",
+           when: {field: "routes", contains_any: ["lan"]}, level: "warn",
+           text: ("Routing to the LAN needs masquerade for " + $t + " -> " + $lan_if + ". It is <state>."),
+           check: "routing-status:lan"},
+          {id: "needs-nat-full",
+           when: {field: "routes", contains_any: ["full"]}, level: "warn",
+           text: ("Full tunnel routes 0.0.0.0/0, which captures the ENTIRE default route of the client - all of its traffic will transit this host. It needs masquerade for " + $t + " -> " + $full_if + ". It is <state>."),
+           check: "routing-status:full"},
+          {id: "needs-nat-lab",
+           when: {field: "routes", contains_any: ["lab"]}, level: "warn",
+           text: ("Routing to the lab needs masquerade for " + $t + " -> " + $lab_if + ". It is <state>."),
+           check: "routing-status:lab"},
+          {id: "needs-forward",
+           when: {field: "routes", contains_any: ["lan", "full", "lab", "static-edt", "edy-lab"]},
+           level: "warn",
+           text: "Gateway support: net.ipv4.ip_forward must be 1, or the tunnel connects and nothing behind this host answers. It is <state>.",
+           check: "routing-status:ip_forward"},
+          {id: "edy-lab-info",
+           when: {field: "routes", contains_any: ["edy-lab"]}, level: "info",
+           text: "The headscale control plane (172.20.10.1:8085) is host-local: traffic to it arrives on the INPUT chain of this host, not FORWARD, so no masquerade is needed to reach it. Only traffic to the VMs behind virbr-edy needs forwarding and NAT.",
+           check: null} ]')"
+
+    jq -nc --argjson client "$f_client" --argjson routing "$f_routing" \
+           --argjson server "$f_server" --argjson recos "$recos" '
+        {version: 2,
+         groups: [
+           {id: "client-config", title: "Client configuration", order: 1, fields: $client},
+           {id: "routing",       title: "Routing and NAT",      order: 2, fields: $routing},
+           {id: "server",        title: "Server",               order: 3, readonly: true, fields: $server}],
+         recommendations: $recos}'
+}
+
+# -------------------------------------------------------------- IPAM verbs --
+
+verb_ipam_status() {
+    local net="tunnel"
+    while (($#)); do
+        case "$1" in
+            --net) net="${2:-}"; shift 2 ;;
+            --)    shift ;;
+            -*)    die "ipam-status: unknown option: $1" ;;
+            *)     die "ipam-status: unexpected argument: $1" ;;
+        esac
+    done
+    ipam_net_ok "$net" || die "ipam-status: --net must be one of: ${IPAM_NETS[*]}"
+
+    with_lock
+    local prefix cidr state free_json
+    prefix="$(pool_prefix "$net")" || die "no /24 pool for net: $net"
+    cidr="$(net_cidr "$net")"
+    state="$(ipam_load)" || die "cannot read ipam state"
+    free_json="$(pool_taken "$net" state | sort -u | pool_free "$prefix" \
+                 | jq -Rnc '[inputs]')"
+    jq -nc --argjson state "$state" --arg p "$prefix." --arg net "$net" \
+           --arg cidr "$cidr" --argjson free "$free_json" \
+           --argjson first "$IPAM_HOST_FIRST" --argjson last "$IPAM_HOST_LAST" '
+        {pool: {net: $net, cidr: $cidr,
+                first: ($p + ($first | tostring)), last: ($p + ($last | tostring)),
+                size: ($last - $first + 1)},
+         reserved: [$state.reserved[] | select(.ip | startswith($p))],
+         observed: [$state.observed[] | select(.ip | startswith($p))],
+         free: $free,
+         lru: ([$state.observed[] | select(.ip | startswith($p))]
+               | sort_by(.last_seen // ""))}'
+}
+
+verb_ipam_reserve() {
+    local name="" mac="" pubkey="" addr now state
+    local -a pos=()
+    while (($#)); do
+        case "$1" in
+            --name)   name="${2:-}";   shift 2 ;;
+            --mac)    mac="${2:-}";    shift 2 ;;
+            --pubkey) pubkey="${2:-}"; shift 2 ;;
+            --)       shift ;;
+            -*)       die "ipam-reserve: unknown option: $1" ;;
+            *)        pos+=("$1"); shift ;;
+        esac
+    done
+    addr="${pos[0]:-}"
+    [[ -n "$addr" ]] || die "ipam-reserve: IP is required"
+    valid_ipv4 "$addr" || die "not an IPv4 address: $addr"
+    [[ -n "$name" ]] || die "ipam-reserve: --name is required"
+    valid_name "$name" || die "invalid reservation name: $name"
+    if [[ -n "$mac" ]]; then
+        [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] \
+            || die "not a MAC address: $mac"
+        mac="${mac,,}"
+    fi
+    if [[ -n "$pubkey" ]]; then
+        [[ "$pubkey" =~ ^[A-Za-z0-9+/]{43}=$ ]] \
+            || die "not a WireGuard public key: $pubkey"
+    fi
+    pool_for_ip "$addr" >/dev/null \
+        || die "address $addr is not inside any managed subnet"
+
+    with_lock
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    state="$(ipam_load)" || die "cannot read ipam state"
+    # Idempotent upsert keyed by IP; created survives, identity fields only
+    # ever gain information.
+    state="$(jq -c --arg ip "$addr" --arg name "$name" --arg mac "$mac" \
+                   --arg pubkey "$pubkey" --arg now "$now" '
+        (.reserved | map(.ip == $ip) | index(true)) as $i
+        | .reserved = (if $i != null
+            then (.reserved | .[$i] |= (. + {name: $name}
+                | .mac    = (if $mac    == "" then .mac    else $mac    end)
+                | .pubkey = (if $pubkey == "" then .pubkey else $pubkey end)))
+            else .reserved + [{ip: $ip, name: $name,
+                mac:    (if $mac    == "" then null else $mac    end),
+                pubkey: (if $pubkey == "" then null else $pubkey end),
+                created: $now, last_seen: null}]
+            end)' <<<"$state")" || die "could not update ipam state"
+    printf '%s' "$state" | ipam_save || die "could not write ipam state"
+    jq -nc --argjson state "$state" --arg ip "$addr" \
+        '{ok: true,
+          reservation: ($state.reserved | map(select(.ip == $ip)) | .[0])}'
+}
+
+verb_ipam_release() {
+    local addr state released
+    local -a pos=()
+    while (($#)); do
+        case "$1" in
+            --) shift ;;
+            -*) die "ipam-release: unknown option: $1" ;;
+            *)  pos+=("$1"); shift ;;
+        esac
+    done
+    addr="${pos[0]:-}"
+    [[ -n "$addr" ]] || die "ipam-release: IP is required"
+    valid_ipv4 "$addr" || die "not an IPv4 address: $addr"
+
+    with_lock
+    state="$(ipam_load)" || die "cannot read ipam state"
+    released="$(jq -c --arg ip "$addr" '[.reserved[] | select(.ip == $ip)] | length > 0' <<<"$state")"
+    state="$(jq -c --arg ip "$addr" \
+        '.reserved = [.reserved[] | select(.ip != $ip)]' <<<"$state")" \
+        || die "could not update ipam state"
+    printf '%s' "$state" | ipam_save || die "could not write ipam state"
+    jq -nc --arg ip "$addr" --argjson released "$released" \
+        '{ok: true, ip: $ip, released: $released}'
+}
+
+verb_ipam_scan() {
+    local net="tunnel"
+    while (($#)); do
+        case "$1" in
+            --net) net="${2:-}"; shift 2 ;;
+            --)    shift ;;
+            -*)    die "ipam-scan: unknown option: $1" ;;
+            *)     die "ipam-scan: unexpected argument: $1" ;;
+        esac
+    done
+    # lan (192.168.2.0/24) is scannable ONLY by explicit request - the default
+    # is tunnel, so it can never be swept by accident.
+    ipam_net_ok "$net" || die "ipam-scan: --net must be one of: ${IPAM_NETS[*]}"
+
+    local prefix cidr now tmpd sweep a_ip a_mac a_rtt
+    prefix="$(pool_prefix "$net")" || die "no /24 pool for net: $net"
+    cidr="$(net_cidr "$net")"
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    tmpd="$(mktemp -d)" || die "mktemp failed"
+    sweep="$tmpd/alive"
+
+    # Sweep BEFORE taking the lock - it holds the lock for milliseconds, not
+    # for the length of the ping run. The sweep also freshens the neighbour
+    # table, which is read afterwards on purpose.
+    ipam_sweep "$prefix" > "$sweep" || true
+
+    local -A MACOF=() ALIVE_RTT=()
+    while read -r a_ip a_mac; do MACOF["$a_ip"]="$a_mac"; done < <(neigh_map "$prefix")
+    while read -r a_ip a_rtt; do ALIVE_RTT["$a_ip"]="$a_rtt"; done < "$sweep"
+
+    # Observed-row updates: identity is the MAC on L2, the wg public key on
+    # the tunnel (peers have no MAC), and the bare IP as a last resort for a
+    # ping reply with no neighbour entry.
+    local updates u_ip u_pub u_epoch u_iso
+    updates="$( {
+        for u_ip in ${ALIVE_RTT[@]+"${!ALIVE_RTT[@]}"}; do
+            jq -nc --arg ip "$u_ip" --arg mac "${MACOF[$u_ip]:-}" --arg ls "$now" \
+                '{ip: $ip, mac: $mac, pubkey: "", source: "ping", last_seen: $ls}'
+        done
+        for u_ip in ${MACOF[@]+"${!MACOF[@]}"}; do
+            if [[ -n "${ALIVE_RTT[$u_ip]:-}" ]]; then continue; fi
+            jq -nc --arg ip "$u_ip" --arg mac "${MACOF[$u_ip]}" --arg ls "$now" \
+                '{ip: $ip, mac: $mac, pubkey: "", source: "arp", last_seen: $ls}'
+        done
+        while read -r u_ip u_pub u_epoch; do
+            u_iso=""
+            if [[ "$u_epoch" =~ ^[0-9]+$ ]] && (( u_epoch > 0 )); then
+                u_iso="$(date -u -d "@$u_epoch" +%Y-%m-%dT%H:%M:%SZ)"
+            fi
+            jq -nc --arg ip "$u_ip" --arg pub "$u_pub" --arg ls "$u_iso" \
+                '{ip: $ip, mac: "", pubkey: $pub, source: "wg", last_seen: $ls}'
+        done < <(wg_peer_rows "$prefix")
+    } | jq -sc '.')"
+
+    with_lock
+    local state
+    state="$(ipam_load)" || die "cannot read ipam state"
+    state="$(jq -c --argjson updates "$updates" --arg now "$now" '
+        def idkey(r): if ((r.pubkey // "") != "") then "w:" + r.pubkey
+                      elif ((r.mac // "") != "") then "m:" + r.mac
+                      else "i:" + r.ip end;
+        ([$updates[].ip]) as $seen
+        | .observed = (
+            ((.observed | map({(idkey(.)): .}) | add) // {})
+            | reduce $updates[] as $u (.;
+                idkey($u) as $k
+                | if has($k) then
+                    .[$k] += {ip: $u.ip, source: $u.source}
+                    | .[$k].mac       = (if ($u.mac    // "") != "" then $u.mac    else .[$k].mac    end)
+                    | .[$k].pubkey    = (if ($u.pubkey // "") != "" then $u.pubkey else .[$k].pubkey end)
+                    | .[$k].last_seen = (if ($u.last_seen // "") != "" then $u.last_seen else .[$k].last_seen end)
+                  else
+                    .[$k] = {ip: $u.ip,
+                             mac:    (if ($u.mac    // "") == "" then null else $u.mac    end),
+                             pubkey: (if ($u.pubkey // "") == "" then null else $u.pubkey end),
+                             first_seen: $now,
+                             last_seen:  (if ($u.last_seen // "") == "" then null else $u.last_seen end),
+                             source: $u.source}
+                  end)
+            | [.[]] | sort_by(.ip | split(".") | map(tonumber)))
+        | .reserved = (.reserved | map(
+            if ([.ip] | inside($seen)) then .last_seen = $now else . end))
+        ' <<<"$state")" || die "could not merge scan results"
+    printf '%s' "$state" | ipam_save || die "could not write ipam state"
+
+    local alive_json free_json scanned
+    scanned=$(( IPAM_HOST_LAST - IPAM_HOST_FIRST + 1 ))
+    alive_json="$( {
+        for u_ip in ${ALIVE_RTT[@]+"${!ALIVE_RTT[@]}"}; do
+            jq -nc --arg ip "$u_ip" --arg mac "${MACOF[$u_ip]:-}" \
+                   --arg rtt "${ALIVE_RTT[$u_ip]}" \
+                '{ip: $ip, mac: (if $mac == "" then null else $mac end),
+                  rtt_ms: ($rtt | tonumber? // null)}'
+        done
+    } | jq -sc 'sort_by(.ip | split(".") | map(tonumber))')"
+    free_json="$(pool_taken "$net" live "$sweep" | sort -u | pool_free "$prefix" \
+                 | jq -Rnc '[inputs]')"
+    rm -rf "$tmpd"
+
+    jq -nc --arg net "$net" --arg cidr "$cidr" --argjson scanned "$scanned" \
+           --argjson alive "$alive_json" --argjson free "$free_json" \
+        '{net: $net, cidr: $cidr, scanned: $scanned, alive: $alive, free: $free}'
+}
+
+# -------------------------------------------------------------------- main --
+
+usage() {
+    cat >&2 <<'USAGE'
+wg-admin - WireGuard client/config helper (one JSON object on stdout)
+
+  wg-admin catalogue
+  wg-admin list
+  wg-admin new-client NAME [--ip A.B.C.D]
+  wg-admin add-config NAME CFG --routes id[,id...] [tunables]
+  wg-admin add-config NAME CFG --preset tunnel-only|lab|lan|full [tunables]
+  wg-admin get-config NAME CFG [--qr]
+  wg-admin del-config NAME CFG
+  wg-admin del-client NAME
+  wg-admin routing-status
+  wg-admin routing-set DEST on|off        (DEST also accepts ip_forward)
+  wg-admin schema
+  wg-admin ipam-status  [--net tunnel|lab|static-edt|lan]
+  wg-admin ipam-reserve IP --name N [--mac M] [--pubkey K]
+  wg-admin ipam-release IP
+  wg-admin ipam-scan    [--net tunnel|lab|static-edt|lan]
+  wg-admin client-package NAME CFG --os windows|linux|pfsense|opnsense|freebsd
+
+tunables for add-config:
+  --mtu N          1280-1500, default 1420
+  --keepalive N    0-65535,   default 25
+  --dns ADDR       IPv4,      default auto-detected
+
+Route ids: tunnel lan static-edt lab edy-lab elt-static full
+Endpoint port comes from PUBLIC_PORT in /etc/wireguard/wg-admin.conf - the port
+the ROUTER forwards - not from wg0's local listen port.
+
+IPAM state lives in /etc/wireguard/ipam.json (0600 root:root). --net defaults
+to tunnel; lan (192.168.2.0/24) is scanned ONLY when named explicitly. For
+tests only, WG_ADMIN_TEST_MODE=1 plus WG_ADMIN_IPAM_FILE=<path> points the
+ipam verbs at a throwaway state file; without the test flag an override is
+honoured only inside /etc/wireguard.
+USAGE
+}
+
+main() {
+    local verb="${1:-}"
+    [[ -n "$verb" ]] || { usage; die "no verb given" 2; }
+    shift
+    need_tools jq
+    # Fail fast on a rejected state-file override rather than letting later
+    # helpers half-honour it (used_octets would silently skip ipam otherwise).
+    # The subshell matters: ipam_file bails with exit, which would otherwise
+    # kill the script before die could print the JSON error object.
+    if [[ -n "${WG_ADMIN_IPAM_FILE:-}" ]] && ! (ipam_file >/dev/null 2>&1); then
+        die "WG_ADMIN_IPAM_FILE refused: parent must be ${STATE_DIR}, or set WG_ADMIN_TEST_MODE=1"
+    fi
+    case "$verb" in
+        catalogue)      verb_catalogue "$@" ;;
+        list)           need_root; need_tools wg;                    verb_list "$@" ;;
+        new-client)     need_root; need_tools wg ip;                 verb_new_client "$@" ;;
+        add-config)     need_root; need_tools wg ip python3 flock;   verb_add_config "$@" ;;
+        get-config)     need_root;                                   verb_get_config "$@" ;;
+        del-config)     need_root; need_tools flock;                 verb_del_config "$@" ;;
+        del-client)     need_root; need_tools wg python3 flock;      verb_del_client "$@" ;;
+        routing-status) need_root; need_tools iptables ip;           verb_routing_status "$@" ;;
+        routing-set)    need_root; need_tools iptables ip systemctl; verb_routing_set "$@" ;;
+        schema)         need_root; need_tools wg ip iptables;        verb_schema "$@" ;;
+        ipam-status)    need_root; need_tools wg ip flock;           verb_ipam_status "$@" ;;
+        ipam-reserve)   need_root; need_tools flock;                 verb_ipam_reserve "$@" ;;
+        ipam-release)   need_root; need_tools flock;                 verb_ipam_release "$@" ;;
+        ipam-scan)      need_root; need_tools wg ip ping flock;      verb_ipam_scan "$@" ;;
+        client-package) need_root
+                        # Owned by wg-admin-package; wg-admin only dispatches.
+                        [[ -x /usr/local/sbin/wg-admin-package ]] \
+                            || die "wg-admin-package not installed"
+                        exec /usr/local/sbin/wg-admin-package "$@" ;;
+        -h|--help|help) usage; exit 0 ;;
+        --version)      jq -nc --arg version "$VERSION" '{version: $version}' ;;
+        *)              usage; die "unknown verb: $verb" 2 ;;
+    esac
+}
+
+# Only dispatch when executed, so the functions above can be sourced by tests.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

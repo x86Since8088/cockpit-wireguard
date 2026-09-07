@@ -1,0 +1,164 @@
+{
+    "version": 2,
+    "groups": [
+        {
+            "id": "tunnel",
+            "title": "Tunnel interface",
+            "order": 1,
+            "fields": [
+                {
+                    "id": "mtu",
+                    "label": "MTU",
+                    "control": "number",
+                    "default": 1420,
+                    "min": 1280,
+                    "max": 1500,
+                    "placeholder": "1420",
+                    "help": "Packet size on the tunnel interface.",
+                    "breaks_when_wrong": "Too large: the handshake succeeds, ping succeeds, and TCP hangs on the first full-size frame.",
+                    "unit": "bytes"
+                },
+                {
+                    "id": "keepalive",
+                    "label": "PersistentKeepalive",
+                    "control": "number",
+                    "default": 25,
+                    "min": 0,
+                    "max": 300,
+                    "placeholder": "25",
+                    "help": "How often the client speaks even when idle, to keep NAT mappings alive.",
+                    "breaks_when_wrong": "Behind NAT the mapping expires after about two minutes and the tunnel goes one-way until the client sends again.",
+                    "unit": "seconds"
+                },
+                {
+                    "id": "dns",
+                    "label": "DNS server",
+                    "control": "text",
+                    "default": "",
+                    "pattern": "^$|^(\\d{1,3}\\.)(\\d{1,3}\\.)(\\d{1,3}\\.)(\\d{1,3})$",
+                    "placeholder": "172.16.0.1",
+                    "help": "Pushed to the client only when set; only useful with a full-tunnel profile.",
+                    "breaks_when_wrong": "A malformed address makes wg-quick fail to bring the interface up at all.",
+                    "unit": null
+                },
+                {
+                    "id": "table",
+                    "label": "Routing table",
+                    "control": "select",
+                    "default": "auto",
+                    "options": [
+                        { "value": "auto", "label": "auto — wg-quick decides" },
+                        { "value": "main", "label": "main table" },
+                        { "value": "off", "label": "off — no routes added" }
+                    ],
+                    "help": "wg-quick's Table= setting for this config.",
+                    "breaks_when_wrong": "off means the AllowedIPs selection is written into the file but never actually routed.",
+                    "unit": null
+                },
+                {
+                    "id": "dns_mode",
+                    "label": "DNS handling",
+                    "control": "radio",
+                    "default": "none",
+                    "options": [
+                        { "value": "none", "label": "Leave client DNS alone" },
+                        { "value": "tunnel", "label": "Resolve through the tunnel" },
+                        { "value": "custom", "label": "Use the server given above" }
+                    ],
+                    "help": "What happens to the client's resolver while the tunnel is up.",
+                    "breaks_when_wrong": "Tunnel DNS on a split-tunnel profile leaks every lookup through the tunnel.",
+                    "unit": null
+                },
+                {
+                    "id": "server_pubkey",
+                    "label": "Server public key",
+                    "control": "readonly",
+                    "default": "FIXTUREServerPubkey0000000000000000000000000=",
+                    "help": "Identifies this host to the client; public by design.",
+                    "breaks_when_wrong": null,
+                    "unit": null
+                },
+                {
+                    "id": "preshared_key",
+                    "label": "Preshared key",
+                    "control": "password-reveal",
+                    "default": "FIXTUREPresharedKeySECRET0000000000000000000=",
+                    "help": "Optional second secret; the same value must be present on both ends.",
+                    "breaks_when_wrong": "A mismatch fails the handshake with no error message on either side.",
+                    "unit": null
+                }
+            ]
+        },
+        {
+            "id": "routing",
+            "title": "Routing",
+            "order": 2,
+            "fields": [
+                {
+                    "id": "routes",
+                    "label": "Destinations",
+                    "control": "cidr-set",
+                    "default": ["tunnel"],
+                    "help": "What the client routes into the tunnel; the server-side /32 is derived from the same selection.",
+                    "breaks_when_wrong": "The single most common failure: the destination list lands on the wrong side and the tunnel connects while nothing works.",
+                    "unit": null
+                },
+                {
+                    "id": "ip_forward",
+                    "label": "IPv4 forwarding",
+                    "control": "toggle",
+                    "default": true,
+                    "help": "net.ipv4.ip_forward on this host; global, not per tunnel.",
+                    "breaks_when_wrong": "The tunnel comes up and this host refuses to pass packets through it.",
+                    "unit": null
+                }
+            ]
+        }
+    ],
+    "recommendations": [
+        {
+            "id": "needs-nat-lan",
+            "when": { "field": "routes", "contains_any": ["lan", "full"] },
+            "level": "warn",
+            "text": "Routing to the LAN needs masquerade for 172.16.0.0/24 → bridge0. It is <state>.",
+            "check": "routing-status:lan"
+        },
+        {
+            "id": "needs-forward",
+            "when": { "field": "routes", "contains_any": ["lan", "lab", "static-edt", "full"] },
+            "level": "warn",
+            "text": "Reaching anything behind this host needs net.ipv4.ip_forward. It is <state>.",
+            "check": "routing-status:ip_forward"
+        },
+        {
+            "id": "keepalive-zero",
+            "when": { "field": "keepalive", "equals": 0 },
+            "level": "info",
+            "text": "Keepalive 0 disables it: behind NAT the tunnel will go one-way when idle."
+        },
+        {
+            "id": "dns-not-none",
+            "when": { "field": "dns_mode", "not_equals": "none" },
+            "level": "info",
+            "text": "Client DNS will be rewritten while the tunnel is up."
+        },
+        {
+            "id": "mtu-high",
+            "when": { "field": "mtu", "gt": 1420 },
+            "level": "warn",
+            "text": "MTU above 1420 rarely survives the WireGuard encapsulation overhead on this path."
+        },
+        {
+            "id": "mtu-low",
+            "when": { "field": "mtu", "lt": 1320 },
+            "level": "info",
+            "text": "MTU below 1320 wastes bandwidth; only double-encapsulated paths need it."
+        },
+        {
+            "id": "forward-on",
+            "when": { "field": "ip_forward", "truthy": true },
+            "level": "info",
+            "text": "Forwarding is enabled host-wide, not per tunnel: every routed interface on this host is affected."
+        }
+    ]
+}
