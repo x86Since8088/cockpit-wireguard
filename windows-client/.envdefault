@@ -1,0 +1,27 @@
+# cockpit-wireguard, Windows client .envdefault
+#
+# Seeded by deploy.ps1 to C:\ProgramData\edt1-wg\.env, MISSING-ONLY. Same grammar
+# as the Linux .envdefault and for the same reason: KEY=value, no export, no
+# interpolation, full-line comments only. See cockpit-secrets/source/docs/
+# DEPLOY-CONTRACT.md section 4.1.
+#
+# LOCATIONS AND SETTINGS ONLY. The tunnel's PrivateKey is NOT here and must never
+# be: it belongs in the .conf that WireGuard imports, which lives in WireGuard's
+# own DPAPI-protected configuration store once imported.
+
+# The tunnel name WireGuard uses. The hook script is invoked with
+# %WIREGUARD_TUNNEL_NAME% and this is what it should match; it is also the name
+# shown in the WireGuard UI. Wrong value: the hooks run against a tunnel that
+# does not exist and the PostUp reachability check fails every time.
+WG_TUNNEL_NAME=edt1-split
+
+# The local container subnet on THIS machine that should reach edt1 through the
+# tunnel. wg-hooks.ps1 adds a route for it on PostUp and removes it on PostDown.
+# Leave EMPTY to disable that handling entirely, which is correct on a laptop
+# that runs no containers.
+WG_CONTAINER_SUBNET=
+
+# Where the hook script's undo journal is written. Under ProgramData because it
+# must survive an upgrade - the payload is replaced wholesale and a journal lost
+# mid-tunnel leaves routes and the forwarding flag un-restored.
+WG_UNDO_JOURNAL_DIR=C:\ProgramData\edt1-wg\state

@@ -4,7 +4,7 @@
         "cockpit": "266"
     },
     "conditions": [
-        {"path-exists": "/usr/bin/wg"}
+        {"path-exists": "/usr/local/sbin/wg-admin"}
     ],
     "menu": {
         "index": {

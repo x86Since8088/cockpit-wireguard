@@ -26,13 +26,98 @@ set -euo pipefail
 shopt -s nullglob
 umask 077
 
+# ------------------------------------------------- deployed configuration --
+#
+# WHERE THIS HELPER'S SETTINGS COME FROM, and why it cannot read the wrong file.
+# (cockpit-secrets/source/docs/DEPLOY-CONTRACT.md sections 4.1 and 4.3.)
+#
+#   1. $WG_ADMIN_ENV, but ONLY when this process is not root and only when the
+#      invoking user owns the file. Tests only. An environment variable that
+#      redirects a ROOT process's configuration is a privilege escalation, and
+#      the fact that the file holds no secrets does not change that it holds
+#      paths this root helper will act on.
+#   2. ENV_FILE= out of /etc/cockpit-wireguard/install.conf, written by
+#      install.sh. This is the normal path and the only one that exists on a
+#      production host.
+#   3. Nothing. Fail, naming install.conf. THERE IS NO STEP 4.
+#
+# There is deliberately no "look beside me" step. This file is reached through
+# /usr/local/sbin/wg-admin, a symlink into the payload; resolving .env relative
+# to the resolved script would land in [install path] on a deployed host - the
+# right answer - and in the DEV CHECKOUT on a dev install, where it would read a
+# test .env. The indirection through install.conf is what makes dev-versus-
+# deployed a fact recorded at install time instead of a coincidence of layout.
+
+INSTALL_CONF="/etc/cockpit-wireguard/install.conf"
+declare -A CFG=()
+CFG_ERROR=""
+
+cfg_parse() {
+    local file=$1 n=0 line k v
+    [[ -r $file ]] || { CFG_ERROR="cannot read $file"; return 1; }
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z $line || ${line:0:1} == "#" ]] && continue
+        [[ $line == *=* ]] || { CFG_ERROR="$file:$n: not KEY=VALUE"; return 1; }
+        k=${line%%=*}; v=${line#*=}
+        k=${k%"${k##*[![:space:]]}"}
+        v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+        [[ $k =~ ^[A-Z][A-Z0-9_]*$ ]] || { CFG_ERROR="$file:$n: bad key '$k'"; return 1; }
+        [[ ${#v} -ge 2 && ${v:0:1} == '"' && ${v: -1} == '"' ]] && v=${v:1:-1}
+        case $v in
+            *'$'*|*'`'*) CFG_ERROR="$file:$n: $k contains \$ or \` - no interpolation (DEPLOY-CONTRACT.md 4.1)"; return 1 ;;
+        esac
+        CFG["$k"]=$v
+    done < "$file"
+    return 0
+}
+
+cfg_load() {
+    local envfile="" conf_env
+    if [[ -n ${WG_ADMIN_ENV:-} ]]; then
+        if [[ $EUID -eq 0 ]]; then
+            printf 'wg-admin: ignoring WG_ADMIN_ENV - this process is root; a root helper takes its configuration from %s only\n' "$INSTALL_CONF" >&2
+        elif [[ -O $WG_ADMIN_ENV && -r $WG_ADMIN_ENV ]]; then
+            envfile=$WG_ADMIN_ENV
+        else
+            printf 'wg-admin: ignoring WG_ADMIN_ENV - %s is not a readable file you own\n' "$WG_ADMIN_ENV" >&2
+        fi
+    fi
+    if [[ -z $envfile ]]; then
+        cfg_parse "$INSTALL_CONF" || { CFG_ERROR="no $INSTALL_CONF ($CFG_ERROR). Run install.sh."; return 1; }
+        conf_env=${CFG[ENV_FILE]:-}
+        CFG=()
+        [[ -n $conf_env ]] || { CFG_ERROR="$INSTALL_CONF does not set ENV_FILE. Re-run install.sh."; return 1; }
+        envfile=$conf_env
+    fi
+    cfg_parse "$envfile" || { CFG_ERROR="$envfile: $CFG_ERROR"; return 1; }
+    return 0
+}
+
+cfg_load || true      # deferred: --help and --version work without a config
+
+# Every verb that touches the host calls this first.
+need_config() {
+    [[ -z $CFG_ERROR ]] && return 0
+    die "not configured: $CFG_ERROR
+  A deployed wg-admin reads $INSTALL_CONF, and that file names the .env it
+  should use. Neither is optional and neither is guessed." 3
+}
+
 VERSION="2.0.0"
 
 # ---------------------------------------------------------------- constants --
 
-WG_IF="wg0"
-TUNNEL_CIDR="172.16.0.0/24"
-TUNNEL_PREFIX="172.16.0"
+# Values below come from the deployed .env when one is configured, and fall back
+# to what this host has always used when it is not - so --help and --version
+# still work on an unconfigured box while every real verb goes through
+# need_config and refuses.
+WG_IF="${CFG[WG_INTERFACE]:-wg0}"
+TUNNEL_CIDR="${CFG[WG_TUNNEL_CIDR]:-172.16.0.0/24}"
+# Derived, never configured separately: two keys that can disagree about the same
+# network is a bug waiting for a /24 that is not 172.16.0.0/24.
+TUNNEL_PREFIX="$(IFS=. read -r a b c _ <<<"${TUNNEL_CIDR%%/*}"; printf '%s.%s.%s' "$a" "$b" "$c")"
 TUNNEL_FIRST=2
 TUNNEL_LAST=254
 
@@ -41,7 +126,7 @@ TUNNEL_LAST=254
 # store, so neither can ever be handed out even if discovery fails.
 declare -ra RESERVED_OCTETS=(1 11)
 
-STATE_DIR="/etc/wireguard"
+STATE_DIR="${CFG[WG_STATE_DIR]:-/etc/wireguard}"
 CLIENTS_DIR="${STATE_DIR}/clients"
 LOCK_FILE="${STATE_DIR}/.wg-admin.lock"
 ROUTES_STATE="${STATE_DIR}/wg-admin-routes"
@@ -76,10 +161,10 @@ IPAM_SCAN_CONCURRENCY=32
 IPAM_HOST_FIRST=2      # .0 is the network, .1 the host/gateway on every pool
 IPAM_HOST_LAST=254     # .255 is broadcast
 
-DEFAULT_MTU=1420
-DEFAULT_KEEPALIVE=25
-DEFAULT_DNS="8.8.8.8"
-DEFAULT_PORT=51820
+DEFAULT_MTU="${CFG[WG_CLIENT_MTU]:-1420}"
+DEFAULT_KEEPALIVE="${CFG[WG_CLIENT_KEEPALIVE]:-25}"
+DEFAULT_DNS="${CFG[WG_CLIENT_DNS]:-8.8.8.8}"
+DEFAULT_PORT="${CFG[WG_LISTEN_PORT]:-51820}"
 MTU_MIN=1280
 MTU_MAX=1500
 ENDPOINT_PLACEHOLDER="<PUBLIC-ENDPOINT>"
@@ -113,6 +198,11 @@ bail() { err "$*"; exit 1; }
 
 need_root() {
     [[ ${EUID:-$(id -u)} -eq 0 ]] || die "must run as root (invoke via superuser)"
+    # Every verb that touches the host goes through here, which makes this the
+    # one place a missing or malformed configuration has to be caught. Failing
+    # here rather than at load time keeps --help and --version working on a box
+    # that has not been installed yet.
+    need_config
 }
 
 need_tools() {

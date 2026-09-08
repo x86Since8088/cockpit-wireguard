@@ -27,11 +27,71 @@
 
 set -Eeuo pipefail
 
-WG_POLICY="${WG_POLICY_BIN:-/usr/local/sbin/wg-policy}"
-INTERVAL="${WG_POLICY_INTERVAL:-10}"     # seconds between polls
-STATE="${WG_POLICY_WATCH_STATE:-/run/wg-policy-watch.state}"
-
 log() { printf '%s wg-policy-watch: %s\n' "$(date -Is)" "$*"; }
+die() { log "$*"; exit 1; }
+
+# ------------------------------------------------- deployed configuration --
+# DEPLOY-CONTRACT.md sections 4.1/4.3. Resolution order, and there is no step 4:
+#   1. $WG_POLICY_WATCH_ENV   - non-root only, owner-checked. TESTS ONLY.
+#   2. ENV_FILE= out of /etc/cockpit-wireguard/install.conf, written by
+#      install.sh. The normal path, and the only one on a production host.
+#   3. Fail, naming install.conf.
+# No "look beside me" step: this file is reached through a symlink into the
+# payload, and resolving .env relative to itself would read the dev checkout's
+# test .env on a dev install.
+INSTALL_CONF="/etc/cockpit-wireguard/install.conf"
+declare -A CFG=()
+
+cfg_parse() {
+    local file=$1 n=0 line k v
+    [[ -r $file ]] || { printf 'wg-policy-watch: cannot read %s\n' "$file" >&2; return 1; }
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z $line || ${line:0:1} == "#" ]] && continue
+        [[ $line == *=* ]] || { printf 'wg-policy-watch: %s:%d: not KEY=VALUE\n' "$file" "$n" >&2; return 1; }
+        k=${line%%=*}; v=${line#*=}
+        k=${k%"${k##*[![:space:]]}"}
+        v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+        [[ $k =~ ^[A-Z][A-Z0-9_]*$ ]] || { printf 'wg-policy-watch: %s:%d: bad key %s\n' "$file" "$n" "$k" >&2; return 1; }
+        [[ ${#v} -ge 2 && ${v:0:1} == '"' && ${v: -1} == '"' ]] && v=${v:1:-1}
+        case $v in *'$'*|*'`'*) printf 'wg-policy-watch: %s:%d: %s contains $ or ` - no interpolation\n' "$file" "$n" "$k" >&2; return 1 ;; esac
+        CFG["$k"]=$v
+    done < "$file"
+}
+
+cfg_load() {
+    local envfile="" conf_env
+    if [[ -n ${WG_POLICY_WATCH_ENV:-} ]]; then
+        if [[ $EUID -eq 0 ]]; then
+            printf 'wg-policy-watch: ignoring WG_POLICY_WATCH_ENV - a root helper is configured by %s only\n' "$INSTALL_CONF" >&2
+        elif [[ -O ${WG_POLICY_WATCH_ENV} && -r ${WG_POLICY_WATCH_ENV} ]]; then
+            envfile=${WG_POLICY_WATCH_ENV}
+        else
+            printf 'wg-policy-watch: ignoring WG_POLICY_WATCH_ENV - not a readable file you own\n' >&2
+        fi
+    fi
+    if [[ -z $envfile ]]; then
+        cfg_parse "$INSTALL_CONF" || die "no usable $INSTALL_CONF. Run install.sh; a deployed helper does not guess where its configuration lives."
+        conf_env=${CFG[ENV_FILE]:-}
+        CFG=()
+        [[ -n $conf_env ]] || die "$INSTALL_CONF does not set ENV_FILE. Re-run install.sh."
+        envfile=$conf_env
+    fi
+    cfg_parse "$envfile" || die "could not read $envfile"
+}
+
+cfg_load
+
+# CODE resolves relative to this script; CONFIG resolves through install.conf.
+# They answer different questions - "which payload did I ship with" and "how is
+# this host set up" - and that is why the two rules differ. wg-policy is code.
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+WG_POLICY="$(dirname -- "$SELF")/wg-policy"
+[[ -x "$WG_POLICY" ]] || WG_POLICY=/usr/local/sbin/wg-policy
+
+INTERVAL="${CFG[WG_POLICY_INTERVAL]:-10}"
+STATE="${CFG[WG_POLICY_WATCH_STATE]:-/run/wg-policy-watch.state}"
 
 command -v wg >/dev/null 2>&1 || { log "wg not found"; exit 1; }
 [[ -x "$WG_POLICY" ]] || { log "wg-policy not executable at $WG_POLICY"; exit 1; }

@@ -1,0 +1,76 @@
+# wg-policy-watch.service.in - TEMPLATE. install.sh renders this; nothing
+# installs the .in file itself.
+#
+# HOW A UNIT FINDS THE INSTALL PATH  (docs/DEPLOY-CONTRACT.md section 6.2)
+#
+#   It does not search, and it does not carry a literal. install.sh substitutes
+#   the at-sign placeholders below with the paths it just resolved for itself,
+#   and then REFUSES to write the unit if any of them survives. That refusal is
+#   the whole point of using a token that appears nowhere else: a sed over a
+#   literal old path (which is what samba-ad-lab/sysvol/install-timer.sh does)
+#   silently no-ops when the committed unit is edited, and installs a
+#   working-looking unit that points at a dead path.
+#
+#   Note for whoever edits this comment: install.sh greps the RENDERED file for
+#   any surviving at-sign token, comments included. Do not write an unsubstituted
+#   one here - the guard cannot tell prose from a missed substitution, and it is
+#   right not to try.
+#
+#   The rendered ExecStart names the payload directly rather than
+#   /usr/local/sbin/wg-policy-watch, so this unit does not depend on the sbin
+#   symlink existing. Uninstalling the Cockpit page cannot leave a daemon
+#   pointing at a link that is no longer there.
+#
+#   The executable directory is its own token, not "payload/bin", because a
+#   deployed payload keeps helpers in bin/ and a dev checkout keeps them at the
+#   root. That is the single asymmetry the contract tolerates (JC-5) and this is
+#   the one place a unit has to care about it.
+#
+# WHO CREATES AND STARTS IT  (section 6.1)
+#
+#   install.sh renders and places this file and runs `systemctl daemon-reload`.
+#   It NEVER enables, starts, restarts or stops it - and in a dev install it
+#   refuses to render it at all without --with-units, because a developer running
+#   install.sh from the share on a host that already has a deployed install would
+#   otherwise get two reconcilers fighting over one firewall with two different
+#   policy files.
+#
+#   deploy.sh enables and starts it, and only when the operator passes
+#   --with-policy. A deployment that silently starts a daemon which rewrites
+#   iptables rules is not a deployment anyone should run twice.
+
+[Unit]
+Description=Reconcile WireGuard routing policy when a client connects
+Documentation=file:@ENV_FILE@
+# Start after the boot-time rule installer so the first reconcile compares
+# against the intended baseline rather than an empty table.
+After=network-online.target wg-lan-nat.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Not EnvironmentFile=-: this daemon rewrites firewall rules, and one running
+# with compiled-in defaults it was never configured with is worse than one that
+# refuses to start. A missing .env fails the unit, loudly, in `systemctl status`.
+EnvironmentFile=@ENV_FILE@
+ExecStart=@BIN@/wg-policy-watch
+Restart=always
+RestartSec=5
+
+# No PartOf/BindsTo: the poll loop already re-reconciles continuously, so a
+# podman or libvirt restart that strips the rules is caught on the next tick
+# without coupling this unit's lifecycle to theirs.
+# Needs raw netlink + iptables; nothing else.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+# /run for the handshake state file; the payload is read-only to it by virtue of
+# not being listed here, which is what "the payload is immutable once written"
+# means in practice.
+ReadWritePaths=/run
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

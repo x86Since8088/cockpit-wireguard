@@ -93,33 +93,167 @@ root says so and why — rather than rendering blank.
 
 ---
 
-## Install
+## Install and deploy
 
-`install.sh` **must run as root**; `/usr/share/cockpit` is root-owned. It
-refuses to run otherwise rather than half-installing a package Cockpit would
-serve with the wrong permissions.
+There are **two** processes and they are not the same thing.
+
+| | `install.sh` | `deploy.sh` / `deploy.ps1` / `deploy.bat` |
+|---|---|---|
+| What it is | An in-place install **by symlink**, from wherever it is run | The real deployment: a copy, then config, then `install.sh` |
+| Moves bytes? | **No.** It links; it never copies the payload | Yes. It is the only thing that copies |
+| Where it runs from | The payload — dev checkout *or* install path | The dev checkout |
+| Owns `.env`? | No. Reads it, refuses without it | Yes. Seeds it from `.envdefault`, **missing-only** |
+| Owns units? | Renders and places. Never enables or starts | Enables and starts, behind `--with-policy` |
+
+The one idea: **the script is the same; only where it is run from differs.**
+
+### Deploy (the normal case)
 
 ```sh
-sudo ./install.sh                  # -> /usr/share/cockpit/wireguard
-sudo DESTDIR=/tmp/stage ./install.sh   # stage under another root
-sudo ./install.sh --uninstall      # remove it again
+sudo ./deploy.sh                      # -> /opt/cockpit-wireguard
+sudo ./deploy.sh --install-to /srv/x  # somewhere else
+sudo ./deploy.sh --with-policy        # ...and enable the routing reconciler
+sudo ./deploy.sh --verify             # standing checks only, change nothing
+sudo ./deploy.sh --uninstall          # remove links and units, keep the tree
+sudo ./deploy.sh --remove             # remove the deployed tree too
 ```
 
-It validates `manifest.json` as JSON before copying, installs the four files
-`root:root` mode `0644` into a `0755` directory, and deletes anything a
-previous version left behind. It is idempotent. It does **not** restart
-Cockpit, reload systemd, or touch WireGuard, NetworkManager or the firewall.
+That produces:
 
-Reload the browser afterwards. The **Networking → WireGuard** menu entry
-appears on the next login, because Cockpit reads package manifests when a
-session starts.
+```
+/opt/cockpit-wireguard/payload -> payload-1.1.0/      bin/wg-admin, index.html, ...
+/opt/cockpit-wireguard/.env                           your settings   0644 root:root
+/etc/cockpit-wireguard/install.conf                   what install.sh did
+/usr/share/cockpit/wireguard/*        -> payload/*    per-file symlinks
+/usr/local/sbin/{wg-admin,wg-admin-package,wg-policy,wg-policy-watch} -> payload/bin/*
+/etc/systemd/system/wg-policy-watch.service           rendered from systemd/*.in
+```
 
-Confirm Cockpit picked it up:
+**Unmount the share and all of that keeps working.** That is the acceptance
+test, and `install.sh` asserts it after every deployed install: no symlink and
+no unit may resolve into the dev tree.
+
+### Dev install (live editing)
+
+Run the *same* `install.sh` from the checkout. The Cockpit page becomes symlinks
+into the checkout, so editing `wgclient.js` changes what the browser loads on the
+next reload.
+
+```sh
+cp .envdefault .env         # TESTS ONLY, gitignored - see below
+sudo ./install.sh
+sudo ./install.sh --with-units    # only if you really want the unit rendered
+sudo ./install.sh --uninstall
+```
+
+A dev install deliberately breaks when the share is unmounted — it *is* the
+share. It also refuses to render a systemd unit without `--with-units`, because
+two `wg-policy-watch` daemons reconciling one firewall against two policy files
+is a confusing outage nobody should be able to cause by running an installer.
+
+### Which install is this host running?
+
+```sh
+for d in /usr/share/cockpit/*/; do
+    n=${d%/}; n=${n##*/}
+    t=$(readlink -f "$d/index.html" 2>/dev/null) || continue
+    case $t in
+      */ai-orchestrator-storage/*) k="DEV  (share)";;
+      /opt/*)                                    k="prod (/opt)";;
+      "")                                        k="?? no index.html";;
+      *)                                         k="OTHER";;
+    esac
+    printf '%-12s %s  %s\n' "$n" "$k" "$t"
+done
+```
+
+> The snippet matches on `*/ai-orchestrator-storage/*` rather than the full
+> share path, and this table says "retired checkout path" rather than spelling
+> one. That is not squeamishness: `README.md` ships to the install path, and
+> check 9 greps every shipped file for the dev root and for the retired
+> `/opt/sc/...` prefix. The check is deliberately blunt - it cannot tell prose
+> from a hardcoded path, and an exemption list for "files where it is only
+> documentation" is a list that grows until the check means nothing. Rewording
+> two lines is the cheaper half of that trade, and the wildcard match is better
+> documentation anyway: it works wherever the share is mounted.
+
+
+Or read `/etc/cockpit-wireguard/install.conf`, which records `INSTALL_KIND`,
+`INSTALL_PATH`, `PAYLOAD`, `ENV_FILE` and `UNITDIR`.
+
+Neither script ever restarts `cockpit.socket`. Reload the browser; the
+**Networking → WireGuard** menu entry appears on the next login, because Cockpit
+reads package manifests when a session starts.
 
 ```sh
 cockpit-bridge --packages | grep wireguard
 # wireguard    WireGuard    /usr/share/cockpit/wireguard
 ```
+
+---
+
+## Configuration: `.envdefault` → `[install path]/.env`
+
+`.envdefault` is committed and fully commented. `deploy.sh` copies it to
+`[install path]/.env` **only when that file does not exist** — an operator's
+settings are never clobbered. When a new version adds a key, the deploy *says
+so*, and `install.sh`'s pre-flight refuses if a required key is missing.
+
+**A `.env` in this checkout is TESTS ONLY and is gitignored.** A deployed helper
+cannot read it, and not by discipline: every helper resolves its configuration
+as `$WG_ADMIN_ENV` (non-root only, owner-checked) → `ENV_FILE=` from
+`/etc/cockpit-wireguard/install.conf` → **fail, naming install.conf**. There is
+no "look beside me" step, because that step would land in the checkout on a dev
+install.
+
+A deployed `.env` carries **locations and settings, never secrets**. `deploy.sh`
+refuses to write a key whose name looks like a credential and whose value is not
+a path to one. WireGuard private keys live under `WG_STATE_DIR` at 0600.
+
+---
+
+## The helpers, and why each one ships
+
+| helper | shipped? | why |
+|---|---|---|
+| `wg-admin` | **yes** | `wgclient.js` pins `/usr/local/sbin/wg-admin` in one constant and calls it for every client operation. Until this version the installer never mentioned it, so a fresh clone installed a UI with no backend. |
+| `wg-admin-package` | **yes** | `wg-admin`'s `client-package` verb `exec`s it and dies "wg-admin-package not installed" without it. The page calls `client-package`, so it is a hard runtime dependency even though the page never names it. |
+| `wg-policy` | **yes** | The routing reconciler. Run by an operator (`wg-policy check`) and by the watch unit. |
+| `wg-policy-watch` | **yes** | `ExecStart` of `wg-policy-watch.service`. |
+
+Not shipped, and deliberately: `check.sh`, `tests/`, `docs/`,
+`schema-fixture.json`, `.git/`, any `.env`. `windows-client/` ships to a Windows
+machine via `deploy.ps1`, not to this server.
+
+**The completeness gate.** `install.sh` carries one declaration (`PAGE`,
+`HELPERS`, `LIBS`, `UNITS`, `SEEDS`, `REQUIRED_ENV`) that `deploy.sh` *sources*
+rather than restates — two lists that can disagree is the failure being designed
+out. Nine pre-flight checks refuse before anything is written; check 3 greps the
+shipped page files for `/usr/local/sbin/<x>` literals and refuses any hit that
+`HELPERS` does not install. That is the check that catches the `wg-admin` bug,
+and it is why each helper path must be **one top-of-file literal constant**: a
+path assembled at runtime is invisible to it.
+
+---
+
+## Conformance
+
+Against `cockpit-secrets/source/docs/DEPLOY-CONTRACT.md`, checked 2026-09-07:
+
+| | |
+|---|---|
+| Deploys to `/opt/<project>`, payload versioned, `.env` a sibling | yes |
+| `install.sh` resolves itself with `readlink -f`; links, never copies | yes |
+| Per-file symlinks into a real `/usr/share/cockpit/wireguard` directory | yes |
+| Refuses a `/usr/local/sbin` entry it does not own | yes |
+| Writes `/etc/cockpit-wireguard/install.conf` | yes |
+| Renders units; never enables, starts or stops them | yes |
+| Never touches `cockpit.socket` | yes |
+| No `rm -r` outside `remove_old_payload`'s three assertions | yes |
+| `--uninstall` removes only declared entries and names the data it kept | yes |
+| `.envdefault` in the §4.1 grammar; helpers resolve `.env` via `install.conf` | yes |
+| All nine pre-flight checks and the post-install assertion present | yes |
+| No retired checkout path and no dev-root literal in any shipped file | yes |
 
 ---
 
@@ -129,9 +263,20 @@ cockpit-bridge --packages | grep wireguard
 |---|---|
 | `manifest.json` | Cockpit package manifest: menu label, order 45, keywords, docs links |
 | `index.html` | page skeleton — no inline script, no inline styles |
-| `wireguard.js` | all logic: probes, parsers, rendering, theming |
+| `wireguard.js` | monitoring page: probes, parsers, rendering, theming |
+| `wgclient.js` | the client-management UI; speaks only to `wg-admin` |
 | `wireguard.css` | self-contained stylesheet, light and dark |
-| `install.sh` | root installer |
+| `wg-admin` | the only root entry point for the page; one verb per call, JSON out |
+| `wg-admin-package` | per-OS client bundles; reached through `wg-admin client-package` |
+| `wg-policy` | reconciles volatile forward/NAT rules against the stored policy |
+| `wg-policy-watch` | runs `wg-policy` on a poll; `ExecStart` of the unit |
+| `install.sh` | the symlink installer — the same script for dev and deployed |
+| `deploy.sh` | the Linux deployment: copy a subset, seed `.env`, run `install.sh` |
+| `deploy.ps1` / `deploy.bat` | deploys `windows-client/` to a Windows machine |
+| `.envdefault` | the committed seed for `[install path]/.env` |
+| `etcdefaults/routing-policy.json` | seed for the file `WG_POLICY_FILE` names, missing-only |
+| `systemd/*.in` | unit templates; at-sign tokens substituted at install time |
+| `check.sh` | syntax check plus the standing greps — run it before installing |
 
 ---
 
