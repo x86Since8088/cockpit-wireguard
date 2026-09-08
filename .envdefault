@@ -1,0 +1,77 @@
+# cockpit-wireguard .envdefault
+#
+# Seeded to [install path]/.env by deploy.sh, MISSING-ONLY - an existing .env is
+# never overwritten. See docs/DEPLOY-CONTRACT.md (cockpit-secrets) section 4.
+#
+# Grammar, strictly: KEY=value, KEY="value with spaces", KEY= (empty).
+# Keys match ^[A-Z][A-Z0-9_]*$. No `export`. No $, no ${...}, no $(...), no
+# backticks - there is NO interpolation, because this one file is parsed by sh,
+# by python and by systemd's EnvironmentFile= and only a subset of all three is
+# safe. Full-line comments only; a trailing # is part of the value.
+#
+# LOCATIONS AND SETTINGS ONLY. NEVER A SECRET. This file is 0644 so that a
+# user-class helper can read a port number without escalating, and deploy.sh
+# refuses to write a key that looks like a credential rather than a pointer to
+# one. WireGuard private keys live under WG_STATE_DIR at 0600 and are named by
+# path, never carried here.
+
+# ---------------------------------------------------------------- the tunnel
+
+# The interface wg-admin manages and the UI reports on. Every host tunnel verb
+# operates on this device. Wrong value: the page renders, every verb reports the
+# interface as absent, and no peer can be added.
+WG_INTERFACE=wg0
+
+# Where WireGuard's own state lives: <dir>/wg0.conf, <dir>/clients/<name>/,
+# <dir>/ipam.json, and wg-admin's lock and route-state files. This is NOT under
+# the install path, deliberately - a deploy replaces the payload wholesale and
+# peer keys must survive that. 0700 root:root; wg-admin creates what it needs
+# inside it but will not create the directory itself.
+WG_STATE_DIR=/etc/wireguard
+
+# The tunnel's address pool. wg-admin allocates client addresses out of this and
+# refuses an address outside it. Must be a /24 today; the allocator derives the
+# host prefix from it.
+WG_TUNNEL_CIDR=172.16.0.0/24
+
+# The port the server listens on, and the port written into generated client
+# configurations. Changing it here does not move a running listener - it changes
+# what wg-admin proposes and what a new client config points at.
+WG_LISTEN_PORT=51820
+
+# NOT HERE, deliberately: the public endpoint. wg-admin reads ENDPOINT and
+# DISCOVER_ENDPOINT from <WG_STATE_DIR>/wg-admin.conf, which is operator-managed
+# content with its own discovery fallback. Two files that both claim to set the
+# endpoint is one file too many; this one names WHERE that file lives, by naming
+# WG_STATE_DIR, and stops there.
+
+# ---------------------------------------------------- generated client defaults
+
+# Written into every generated client configuration. MTU below 1280 or above 1500
+# is refused. Keepalive 0 disables it. DNS may be empty for a split tunnel that
+# should keep the client's own resolver.
+WG_CLIENT_MTU=1420
+WG_CLIENT_DNS=8.8.8.8
+WG_CLIENT_KEEPALIVE=25
+
+# ------------------------------------------------------- the routing reconciler
+
+# The stored routing policy: the forward and masquerade rules that must exist for
+# a tunnel to carry traffic. install.sh seeds this path from
+# etcdefaults/routing-policy.json, missing-only - it is operator-edited content,
+# so a re-install never overwrites it. wg-policy reads it; wg-policy-watch runs
+# wg-policy. Wrong value: wg-policy refuses to start and says which file it could
+# not read.
+WG_POLICY_FILE=/etc/wireguard/routing-policy.json
+
+# Seconds between reconcile ticks in wg-policy-watch. Reconciling is idempotent
+# and costs a handful of `iptables -S` reads; the failure it guards against (a
+# container engine rebuilding its chains and dropping the forward rules) leaves
+# clients handshaking and routing nothing, so polling often is much cheaper than
+# missing it.
+WG_POLICY_INTERVAL=10
+
+# Where wg-policy-watch records its last-seen handshake state. Must be on a
+# tmpfs: this is per-boot state and MUST NOT survive a reboot, or a restart
+# treats every already-connected peer as a fresh connect.
+WG_POLICY_WATCH_STATE=/run/wg-policy-watch.state

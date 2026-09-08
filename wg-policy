@@ -35,10 +35,64 @@
 
 set -Eeuo pipefail
 
-POLICY="${WG_POLICY_FILE:-/etc/wireguard/routing-policy.json}"
 TAG_DEFAULT="cockpit-wg"
 
 die() { printf 'wg-policy: %s\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------- deployed configuration --
+# DEPLOY-CONTRACT.md sections 4.1/4.3. Resolution order, and there is no step 4:
+#   1. $WG_POLICY_ENV   - non-root only, owner-checked. TESTS ONLY.
+#   2. ENV_FILE= out of /etc/cockpit-wireguard/install.conf, written by
+#      install.sh. The normal path, and the only one on a production host.
+#   3. Fail, naming install.conf.
+# No "look beside me" step: this file is reached through a symlink into the
+# payload, and resolving .env relative to itself would read the dev checkout's
+# test .env on a dev install.
+INSTALL_CONF="/etc/cockpit-wireguard/install.conf"
+declare -A CFG=()
+
+cfg_parse() {
+    local file=$1 n=0 line k v
+    [[ -r $file ]] || { printf 'wg-policy: cannot read %s\n' "$file" >&2; return 1; }
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z $line || ${line:0:1} == "#" ]] && continue
+        [[ $line == *=* ]] || { printf 'wg-policy: %s:%d: not KEY=VALUE\n' "$file" "$n" >&2; return 1; }
+        k=${line%%=*}; v=${line#*=}
+        k=${k%"${k##*[![:space:]]}"}
+        v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+        [[ $k =~ ^[A-Z][A-Z0-9_]*$ ]] || { printf 'wg-policy: %s:%d: bad key %s\n' "$file" "$n" "$k" >&2; return 1; }
+        [[ ${#v} -ge 2 && ${v:0:1} == '"' && ${v: -1} == '"' ]] && v=${v:1:-1}
+        case $v in *'$'*|*'`'*) printf 'wg-policy: %s:%d: %s contains $ or ` - no interpolation\n' "$file" "$n" "$k" >&2; return 1 ;; esac
+        CFG["$k"]=$v
+    done < "$file"
+}
+
+cfg_load() {
+    local envfile="" conf_env
+    if [[ -n ${WG_POLICY_ENV:-} ]]; then
+        if [[ $EUID -eq 0 ]]; then
+            printf 'wg-policy: ignoring WG_POLICY_ENV - a root helper is configured by %s only\n' "$INSTALL_CONF" >&2
+        elif [[ -O ${WG_POLICY_ENV} && -r ${WG_POLICY_ENV} ]]; then
+            envfile=${WG_POLICY_ENV}
+        else
+            printf 'wg-policy: ignoring WG_POLICY_ENV - not a readable file you own\n' >&2
+        fi
+    fi
+    if [[ -z $envfile ]]; then
+        cfg_parse "$INSTALL_CONF" || die "no usable $INSTALL_CONF. Run install.sh; a deployed helper does not guess where its configuration lives."
+        conf_env=${CFG[ENV_FILE]:-}
+        CFG=()
+        [[ -n $conf_env ]] || die "$INSTALL_CONF does not set ENV_FILE. Re-run install.sh."
+        envfile=$conf_env
+    fi
+    cfg_parse "$envfile" || die "could not read $envfile"
+}
+
+cfg_load
+POLICY="${CFG[WG_POLICY_FILE]:-}"
+[[ -n "$POLICY" ]] || die "WG_POLICY_FILE is not set in the deployed .env"
 
 [[ -r "$POLICY" ]] || die "policy file not readable: $POLICY"
 command -v jq >/dev/null 2>&1 || die "jq is required"
