@@ -2207,7 +2207,8 @@
 
         if (v.qrWanted) {
             if (v.qr) {
-                box.appendChild(el("pre", { cls: "wgc-qr", text: v.qr }));
+                box.appendChild(el("img", { cls: "wgc-qr",
+                    attrs: { src: v.qr, alt: "WireGuard config QR code" } }));
                 box.appendChild(el("div", { cls: "wg-hint", text:
                     "The code encodes the entire configuration, private key included. " +
                     "Do not photograph it, screen-share it, or leave it on screen." }));
