@@ -22,7 +22,9 @@
  *      new-client renders the prominent warning banner
  *   5. the package panel renders five OS tabs, instructions above files,
  *      the undo callout, and masks the private key until revealed
- *   6. a Cockpit problem code is attributed to Cockpit, never to wg-admin
+ *   6. the config viewer renders its QR as a scannable <img> bitmap built
+ *      from the helper's PNG data URL, never a <pre> of text art
+ *   7. a Cockpit problem code is attributed to Cockpit, never to wg-admin
  */
 "use strict";
 
@@ -248,6 +250,12 @@ const CONF_TEXT = "[Interface]\nPrivateKey = SUPERSECRETFIXTUREKEY00000000000000
                   "Address = 172.16.0.7/32\nMTU = 1420\n" +
                   "[Peer]\nAllowedIPs = 172.16.0.0/24\n";
 
+/* wg-admin get-config --qr now returns the QR as a base64 PNG data URL (a real
+   scannable bitmap), not terminal text art. This is a valid 1x1 PNG - the shape
+   is what matters to the renderer. */
+const QR_PNG_DATA_URL =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
 function packageFor(os, name, cfg) {
     return {
         os: os,
@@ -298,7 +306,7 @@ function fakeReply(argv) {
                  reused: true,
                  warning: "The tunnel pool has no free address; reusing the least " +
                           "recently seen 172.16.0.9 (last seen 2026-07-01)." };
-    case "get-config": return { conf: CONF_TEXT, qr: "QRART" };
+    case "get-config": return { conf: CONF_TEXT, qr: QR_PNG_DATA_URL };
     case "client-package": return packageFor(argv[5], argv[2], argv[3]);
     case "ipam-reserve": case "ipam-release":
     case "add-config": case "del-config": case "del-client":
@@ -706,7 +714,33 @@ async function main() {
        "the Linux bundle renders its own steps and files");
 
     /* ============================================================== */
-    section("6. error attribution: a Cockpit problem code is never wg-admin's");
+    section("6. config viewer QR is a scannable <img> bitmap, not text art");
+
+    /* open the config viewer for laptop/lab, then ask for the QR bitmap */
+    fire(buttonExact(container, "Show config")[0], "click");
+    await flush();
+    const markQr = calls.length;
+    fire(buttonExact(container, "Show QR")[0], "click");
+    await flush();
+
+    ok(calls.slice(markQr).some(a => a[1] === "get-config" && a[2] === "laptop" &&
+                                     a[3] === "lab" && a.indexOf("--qr") >= 0),
+       "Show QR fetches the config with `get-config laptop lab --qr`");
+
+    const qrImg = byClass(container, "wgc-qr")[0];
+    ok(!!qrImg && qrImg.tag === "img",
+       "the QR renders as an <img> bitmap, not a <pre> of text art");
+    ok(!!qrImg && qrImg.getAttribute("src") === QR_PNG_DATA_URL,
+       "the <img> src is the helper's PNG data URL, verbatim");
+    ok(!!qrImg && qrImg.getAttribute("src").indexOf("data:image/png;base64,") === 0,
+       "the QR src is a base64 PNG data URL");
+    ok(!!qrImg && (qrImg.getAttribute("alt") || "").length > 0,
+       "the QR <img> carries descriptive alt text");
+    ok(byTag(container, "pre").every(n => !hasClass(n, "wgc-qr")),
+       "no <pre class=\"wgc-qr\"> text-art node is left in the tree");
+
+    /* ============================================================== */
+    section("7. error attribution: a Cockpit problem code is never wg-admin's");
 
     const cls = WGClient.compute.classify;
     ok(cls({ problem: "terminated" }).blame === "cockpit",
@@ -735,7 +769,7 @@ async function main() {
        "the panel explicitly says wg-admin never ran - the code is not backend output");
 
     /* ============================================================== */
-    section("7. hygiene");
+    section("8. hygiene");
 
     ok(superuserViolations.length === 0,
        "all " + calls.length + " spawns used superuser:\"require\"");

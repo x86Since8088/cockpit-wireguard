@@ -1317,7 +1317,15 @@ verb_get_config() {
 
     if (( qr )); then
         ensure_qrencode
-        qrart="$(qrencode -t ansiutf8 < "$p")" || die "qrencode failed"
+        # Emit a real bitmap the browser renders as <img>, not terminal text art.
+        # qrencode writes binary PNG to stdout (-o -); base64 turns it into a
+        # data: URL. pipefail is forced ON inside this subshell so qrencode's own
+        # non-zero exit propagates - without it the pipeline would report only
+        # base64's status, which stays 0 even when qrencode produced nothing.
+        local png_b64
+        png_b64="$(set -o pipefail; qrencode -t PNG -o - -s 6 -m 2 < "$p" | base64 -w0)" \
+            || die "qrencode failed"
+        qrart="data:image/png;base64,$png_b64"
     fi
     if grep -qF -- "$ENDPOINT_PLACEHOLDER" "$p"; then placeholder=true; fi
 

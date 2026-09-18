@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.2 - 2026-09-18
+
+The client-config QR code is now a real scannable bitmap instead of terminal
+text art, so a phone camera can read it straight off the page.
+
+- `wg-admin get-config … --qr` returns `qr` as a `data:image/png;base64,…` URL.
+  It runs `qrencode -t PNG -o - -s 6 -m 2` and base64-encodes the bytes; the
+  pipeline forces `pipefail` on inside its own subshell so `qrencode`'s exit is
+  what fails the step, not `base64`'s (which stays 0 on empty input). The `--qr`
+  flag and the `qr` field name are unchanged; only the value's shape changed.
+- `wgclient.js` renders the QR with `<img class="wgc-qr" src="<data url>">`
+  instead of a `<pre>` of text art. The `--qr` fetch flow and the Show/Hide QR
+  button are untouched.
+- `wireguard.css` restyles `.wgc-qr` for an image: a centered white-padded block
+  with a sensible max width and `image-rendering: pixelated` so the modules stay
+  crisp when the bitmap is scaled.
+- CONTRACT.md and the headless render test track the new shape; the test now
+  asserts the viewer paints an `<img>` whose `src` is the helper's PNG data URL.
+
 ## 1.1.1 - 2026-09-07
 
 Install classification is now decided by LAYOUT, not by a development-root path

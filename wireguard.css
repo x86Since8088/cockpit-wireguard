@@ -588,20 +588,20 @@ ul.wgc-cidrs li { margin-bottom: 0.15rem; overflow-wrap: anywhere; }
 
 pre.wgc-conf { max-height: 22rem; overflow: auto; }
 
-pre.wgc-qr {
-    margin: 0.6rem 0 0;
+img.wgc-qr {
+    display: block;
+    margin: 0.6rem auto 0;
     padding: 0.5rem;
+    width: 15rem;
+    max-width: 100%;
+    height: auto;
+    box-sizing: border-box;
     background: #ffffff;
-    color: #000000;
     border: 1px solid var(--wg-border);
     border-radius: 3px;
-    font-family: var(--wg-mono);
-    font-size: 0.6rem;
-    line-height: 0.6rem;
-    letter-spacing: 0;
-    white-space: pre;
-    overflow-x: auto;
-    display: inline-block;
+    /* A QR needs a light quiet zone to scan; keep the modules crisp when the
+       browser scales the bitmap down to the box above. */
+    image-rendering: pixelated;
 }
 
 .wgc-offscreen { position: fixed; top: -1000px; left: -1000px; opacity: 0; }

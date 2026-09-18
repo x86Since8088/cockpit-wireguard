@@ -62,7 +62,7 @@ wg-admin catalogue                         -> { networks:[...], presets:{...} }
 wg-admin list                              -> { clients:[ {name, ip, configs:[...], enabled} ] }
 wg-admin new-client NAME [--ip A.B.C.D]    -> { name, ip, pubkey }
 wg-admin add-config NAME CFG --routes a,b  -> { name, config, allowed_ips, path }
-wg-admin get-config NAME CFG [--qr]        -> { conf: "<text>", qr: "<utf8 art>" }
+wg-admin get-config NAME CFG [--qr]        -> { conf: "<text>", qr: "<png data url>" }
 wg-admin del-config NAME CFG               -> { ok:true }
 wg-admin del-client NAME                   -> { ok:true }
 wg-admin routing-status                    -> { ip_forward, rules:[{dest,iface,present}] }
