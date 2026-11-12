@@ -1,5 +1,5 @@
 # wg-trash-purge.service.in - TEMPLATE, rendered by install.sh like
-# wg-policy-watch.service.in (same @TOKEN@ rules; see that file's header).
+# wg-policy-watch.service.in (same placeholder rules; see that file's header).
 # Destroys deleted clients/peers past their retention (TRASH_DAYS, default 30).
 # Rendered and placed by install.sh, NEVER enabled by it: enable the timer with
 #   systemctl enable --now wg-trash-purge.timer

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.1
+
+- Fix: the wg-trash-purge.service.in header comment contained a literal placeholder token, which install.sh's unrendered-placeholder check rejected, aborting the install after the payload was linked.
+
 ## 1.2.0
 
 - Host peer table: toolbar above the table (Add peer, Set port, status chips
