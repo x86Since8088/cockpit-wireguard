@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.1.3 - 2026-11-12
+
+Fixes the dashboard errors seen after deleting many peers/clients rapidly.
+
+- `wireguard.js`: a forced `poll(true)` (issued after "Remove peer" etc.) was
+  silently dropped while the 5s auto-poll was in flight, so the pre-removal
+  snapshot repainted removed peers. A forced poll arriving mid-flight now sets
+  a pending flag and exactly one trailing forced poll runs afterwards; the
+  superseded snapshot is not painted, and collect results carry a poll
+  generation so only the newest is applied.
+- `wgclient.js`: all mutations (del-client, del-config, new-client, add-config,
+  routing-set, ipam-*) share one client-side queue, so at most one wg-admin
+  mutation is in flight (no more N concurrent privileged spawns timing out on
+  wg-admin's flock). Queued rows show "Queued..."/"Deleting..."; the per-key
+  double-click guard is kept.
+- `refresh()` is single-flight with trailing coalescing and a generation
+  counter: a stale `list` can no longer repaint deleted clients, and one
+  refresh runs after the queue drains instead of one per mutation.
+- A burst reports one aggregated notice ("Deleted 7 clients", or which changes
+  failed) instead of last-writer-wins. Deleted clients/configs disappear from
+  the list immediately on success.
+- Transient faults (wg-admin lock timeout, Cockpit terminated/timeout/
+  disconnected/internal-error) no longer raise the blocking gate; only genuine
+  privilege / missing-helper faults do. Transient faults show as notices.
+- Tests: new section 9 in `tests/unit/wgclient-render-test.js` and
+  `tests/unit/wireguard-poll-test.js`.
+
 ## 1.1.2 - 2026-09-18
 
 The client-config QR code is now a real scannable bitmap instead of terminal
