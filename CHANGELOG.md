@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.4
+
+- Work around a Cockpit 360 bridge file-descriptor leak: every non-pty `cockpit.spawn` left 1-2 pipe fds open in the privileged bridge, which hit its 1024-fd limit after a few minutes of polling and then failed every command with `internal-error`. All spawns now use `pty: true` (measured: 0 fds leaked), with stderr and exit status carried back as marker lines so error classification is unchanged.
+- The host dashboard poll is one combined spawn instead of six (slow poll: one instead of four).
+- New guard test `tests/unit/no-leaky-spawn-test.js` fails on any spawn without `pty: true`.
+
 ## 1.1.3 - 2026-11-12
 
 Fixes the dashboard errors seen after deleting many peers/clients rapidly.
