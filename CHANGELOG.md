@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.0
+
+- Host peer table: toolbar above the table (Add peer, Set port, status chips
+  All/Connected/Stale/Never connected with counts, text filter on key / endpoint /
+  allowed IP, "Select all shown", per-row checkboxes, "Remove selected (N)").
+  Selection is keyed by public key and survives the 5 s repaint; filters persist
+  in localStorage. Selecting while filtered selects only the rows shown.
+- Bulk remove opens the confirm modal with the count, the first 10 keys, the exact
+  command(s), and "Also delete matching wg-admin clients (persistent)" (default on
+  when a peer's /32 matches a client). One `wg-admin` call per 100 peers; the
+  Clients list refreshes through the shared mutation queue.
+- Clients section: the same toolbar, filter (All/Enabled/Disabled/No configs),
+  select-all-shown and "Delete selected (N)", using one multi-name `del-client`.
+- `wg-admin del-client` accepts several names (one lock, one netplan rewrite,
+  per-name JSON results; single-name output unchanged apart from `trash_id`).
+- 30-day undelete: deletes move data to `/etc/wireguard/trash` instead of shredding;
+  new verbs `peer-remove`, `trash-list`, `restore`, `trash-purge`; trashed client
+  IPs stay reserved (`ipam-status` `held`); "Recently deleted" panels with bulk
+  Restore / Delete permanently; optional `wg-trash-purge.timer` (not auto-enabled).
+- Host peer removal now goes through `wg-admin peer-remove` (snapshot first, still
+  runtime-only).
+
 ## 1.1.4
 
 - Work around a Cockpit 360 bridge file-descriptor leak: every non-pty `cockpit.spawn` left 1-2 pipe fds open in the privileged bridge, which hit its 1024-fd limit after a few minutes of polling and then failed every command with `internal-error`. All spawns now use `pty: true` (measured: 0 fds leaked), with stderr and exit status carried back as marker lines so error classification is unchanged.

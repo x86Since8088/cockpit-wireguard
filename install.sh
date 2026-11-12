@@ -67,7 +67,7 @@ HELPERS=(wg-admin wg-admin-package wg-policy wg-policy-watch)
 LIBS=()
 
 # -> $UNITDIR, rendered from systemd/<name>.in with @PLACEHOLDER@ substitution.
-UNITS=(wg-policy-watch.service)
+UNITS=(wg-policy-watch.service wg-trash-purge.service wg-trash-purge.timer)
 
 # Seed data: <path under the payload>=<the .env KEY naming its destination>.
 # Copied MISSING-ONLY. Naming the destination by .env key rather than by literal
@@ -343,7 +343,7 @@ done
 for s in "${SEEDS[@]}"; do [[ -f "$SRC/${s%%=*}" ]] || missing+=("${s%%=*}"); done
 [[ -f "$SRC/$ENVDEFAULT" ]] || missing+=("$ENVDEFAULT")
 ((${#missing[@]} == 0)) || die "payload is incomplete:$(printf '\n    %s' "${missing[@]}")"
-say "1. payload complete (${#PAGE[@]} page files, ${#HELPERS[@]} helpers, ${#UNITS[@]} unit)"
+say "1. payload complete (${#PAGE[@]} page files, ${#HELPERS[@]} helpers, ${#UNITS[@]} units)"
 
 # --- 2. the page asks only for what is shipped -------------------------------
 # Parsed, not grepped: a regex over HTML is how you miss the one attribute that

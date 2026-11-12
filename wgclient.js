@@ -881,6 +881,8 @@
         schemaFault: null,
         ipam:     normaliseIpam(null),
         ipamFault: null,
+        trash:    [],          /* trash-list entries (metadata only)            */
+        trashFault: null,
         notice:   null,     /* {cls, title, text} from the last mutation       */
         reusedBanner: null  /* the mandatory LRU-reuse warning; sticky until
                                dismissed - never a toast                       */
@@ -895,6 +897,11 @@
         confirm:  Object.create(null),   /* action key   -> armed              */
         busy:     Object.create(null),   /* action key   -> in flight          */
         creating: false,
+        clientSel: Object.create(null),  /* client name -> true (bulk select)   */
+        clientFlt: null,                 /* {status,text}, lazily from storage  */
+        bulkConfirm: false,              /* "Delete selected" confirm open      */
+        trashSel:  Object.create(null),  /* trash id -> true                    */
+        trashOpen: Object.create(null),  /* scope -> bool                       */
         ipamScan: { net: IPAM_SCAN_NETS[0], busy: false, result: null, fault: null }
     };
 
@@ -1018,7 +1025,8 @@
             callAdmin(["list"]),
             callAdmin(["routing-status"]),
             callAdmin(["schema"]),
-            callAdmin(["ipam-status"])
+            callAdmin(["ipam-status"]),
+            callAdmin(["trash-list"])
         ]).then(function (res) {
             refreshRunning = false;
             if (refreshPending || gen !== refreshGen || mutRunning || mutQueue.length) {
@@ -1027,7 +1035,7 @@
                 else runRefresh();
                 return;
             }
-            var c = res[0], l = res[1], r = res[2], s = res[3], ip = res[4];
+            var c = res[0], l = res[1], r = res[2], s = res[3], ip = res[4], tr = res[5];
 
             state.catFault     = c.ok  ? null : c.fault;
             state.listFault    = l.ok  ? null : l.fault;
@@ -1040,6 +1048,8 @@
             if (r.ok)  state.routing = normaliseRouting(r.data);
             if (s.ok)  state.schema  = normaliseSchema(s.data);
             if (ip.ok) state.ipam    = normaliseIpam(ip.data);
+            state.trashFault = tr.ok ? null : tr.fault;
+            if (tr.ok) state.trash = normaliseTrash(tr.data);
 
             /* One genuine blocking fault gates the whole section; it is the
                same escalation failing five times, so report it once. A
@@ -1081,6 +1091,76 @@
         }).filter(function (c) { return !!c.name; });
     }
 
+    /* trash-list -> [{id, kind, name, ip, iface, key, deletedAt, expiresAt}] newest first.
+       Metadata only: wg-admin never sends key material here. */
+    function normaliseTrash(raw) {
+        var list = (raw && raw.entries instanceof Array) ? raw.entries : [];
+        return list.map(function (e) {
+            e = e || {};
+            return {
+                id: String(e.id || ""),
+                kind: e.kind === "peer" ? "peer" : "client",
+                name: String(e.name || ""),
+                ip: String(e.ip || ""),
+                iface: String(e.iface || ""),
+                key: String(e.public_key || ""),
+                deletedAt: Number(e.deleted_at) || 0,
+                expiresAt: Number(e.expires_at) || 0
+            };
+        }).filter(function (e) { return !!e.id; })
+          .sort(function (a, b) { return b.deletedAt - a.deletedAt; });
+    }
+
+    function daysLeft(expiresAt, nowSec) {
+        var d = Math.ceil((expiresAt - nowSec) / 86400);
+        return d < 0 ? 0 : d;
+    }
+
+    /* ---- client bulk select / filter: pure --------------------------------- */
+
+    var CLIENT_FILTERS = [
+        { id: "all",      label: "All" },
+        { id: "enabled",  label: "Enabled" },
+        { id: "disabled", label: "Disabled" },
+        { id: "noconfig", label: "No configs" }
+    ];
+    var BULK_CHUNK = 100;
+
+    function clientMatchesStatus(c, st) {
+        if (st === "enabled") return !!c.enabled;
+        if (st === "disabled") return !c.enabled;
+        if (st === "noconfig") return !c.configs.length;
+        return true;
+    }
+
+    function clientCounts(clients) {
+        var o = { all: clients.length };
+        CLIENT_FILTERS.forEach(function (f) {
+            if (f.id !== "all")
+                o[f.id] = clients.filter(function (c) { return clientMatchesStatus(c, f.id); }).length;
+        });
+        return o;
+    }
+
+    function filterClients(clients, flt) {
+        var st = (flt && flt.status) || "all";
+        var q = String((flt && flt.text) || "").trim().toLowerCase();
+        return clients.filter(function (c) {
+            if (!clientMatchesStatus(c, st)) return false;
+            return !q || c.name.toLowerCase().indexOf(q) >= 0 ||
+                   String(c.ip || "").toLowerCase().indexOf(q) >= 0;
+        });
+    }
+
+    /* [[del-client, n1..n100], [del-client, n101..]] - one wg-admin lock + one
+       netplan rewrite per command. */
+    function buildDelClientCommands(names) {
+        var out = [];
+        for (var i = 0; i < names.length; i += BULK_CHUNK)
+            out.push(["del-client"].concat(names.slice(i, i + BULK_CHUNK)));
+        return out;
+    }
+
     function normaliseRouting(raw) {
         raw = raw || {};
         var rules = (raw.rules instanceof Array) ? raw.rules : [];
@@ -1119,7 +1199,9 @@
     function dropOptimistically(args) {
         var verb = args[0];
         if (verb === "del-client") {
-            state.clients = state.clients.filter(function (c) { return c.name !== args[1]; });
+            var gone = args.slice(1);
+            state.clients = state.clients.filter(function (c) { return gone.indexOf(c.name) < 0; });
+            gone.forEach(function (n) { delete ui.clientSel[n]; });
         } else if (verb === "del-config") {
             state.clients.forEach(function (c) {
                 if (c.name === args[1])
@@ -1151,7 +1233,7 @@
         callAdmin(it.args).then(function (res) {
             mutRunning = false;
             delete ui.busy[it.key];
-            burst.resolvers.push(it.resolve);
+            burst.resolvers.push(function () { it.resolve(res); });
             burst.verbs.push(it.args[0]);
             if (res.ok) {
                 burst.ok.push(it.describe);
@@ -1171,7 +1253,7 @@
         if (n === 1) {
             return b.bad.length
                 ? { cls: "bad", title: b.bad[0].describe.fail, fault: b.bad[0].fault }
-                : { cls: "ok", title: b.ok[0].ok, text: b.ok[0].detail || "" };
+                : { cls: b.ok[0].warn ? "bad" : "ok", title: b.ok[0].ok, text: b.ok[0].detail || "" };
         }
         var allDel = b.verbs.every(function (v) { return v === "del-client"; });
         if (!b.bad.length)
@@ -1237,11 +1319,13 @@
 
         var banner  = el("div", { cls: "wgc-banner" });
         var body    = el("div", { cls: "wgc-body" });
+        var trash   = el("div", { cls: "wgc-trash-wrap" });
         var ipam    = el("div", { cls: "wgc-ipam-wrap" });
         var routing = el("div", { cls: "wgc-routing-wrap" });
 
         root.appendChild(banner);
         root.appendChild(body);
+        root.appendChild(trash);
         root.appendChild(ipam);
         root.appendChild(routing);
         container.appendChild(root);
@@ -1253,6 +1337,7 @@
             refreshBtn: refreshBtn,
             banner: banner,
             body: body,
+            trash: trash,
             ipam: ipam,
             routing: routing
         };
@@ -1304,8 +1389,10 @@
         paintStatus();
         paintBanner();
         paintBody();
+        paintTrash();
         paintIpam();
         paintRouting();
+        repaintTrashNodes();
     }
 
     /* ------------------------------------------------------------------ *
@@ -1441,17 +1528,343 @@
             return;
         }
 
-        var actionsRow = el("div", { cls: "wgc-actions" });
-        if (!ui.creating)
-            actionsRow.appendChild(button("Create client", "primary", function () {
-                ui.creating = true; paintBody();
-            }));
-        dom.body.appendChild(actionsRow);
+        var shown = filterClients(state.clients, clientFlt());
+        /* selection is trimmed to clients that still exist and are shown */
+        var shownNames = Object.create(null);
+        shown.forEach(function (c) { shownNames[c.name] = true; });
+        Object.keys(ui.clientSel).forEach(function (n) { if (!shownNames[n]) delete ui.clientSel[n]; });
 
-        state.clients.slice().sort(function (a, b) {
+        dom.body.appendChild(clientToolbar(shown));
+        if (ui.bulkConfirm && Object.keys(ui.clientSel).length)
+            dom.body.appendChild(bulkConfirmBox());
+        else ui.bulkConfirm = false;
+
+        if (!shown.length)
+            dom.body.appendChild(el("div", { cls: "wg-empty", text: "No clients match the filter." }));
+        shown.slice().sort(function (a, b) {
             return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
         }).forEach(function (c) { dom.body.appendChild(clientCard(c)); });
     }
+
+    function lsGet(k) { try { return window.localStorage.getItem(k); } catch (e) { return null; } }
+    function lsSet(k, v) { try { window.localStorage.setItem(k, v); } catch (e) { /* blocked */ } }
+
+    function clientFlt() {
+        if (!ui.clientFlt) {
+            var f = { status: "all", text: "" };
+            try {
+                var sv = JSON.parse(lsGet("wg:clientfilter") || "null");
+                if (sv && CLIENT_FILTERS.some(function (x) { return x.id === sv.status; })) f.status = sv.status;
+                if (sv && typeof sv.text === "string") f.text = sv.text.slice(0, 200);
+            } catch (e) { /* ignore */ }
+            ui.clientFlt = f;
+        }
+        return ui.clientFlt;
+    }
+    function saveClientFlt() { lsSet("wg:clientfilter", JSON.stringify(clientFlt())); }
+
+    /* Repaint the list but keep the caret in the filter box. */
+    function repaintKeepFocus() {
+        var ae = document.activeElement;
+        var id = (ae && ae.getAttribute) ? ae.getAttribute("data-wg-focus") : null;
+        var st = id ? { a: ae.selectionStart, b: ae.selectionEnd } : null;
+        paintBody();
+        if (!id) return;
+        var found = null;
+        (function walk(n) {
+            if (found || !n) return;
+            if (n.getAttribute && n.getAttribute("data-wg-focus") === id) { found = n; return; }
+            Array.prototype.forEach.call(n.children || [], walk);
+        })(dom.body);
+        if (found && found.focus) {
+            found.focus();
+            try { found.setSelectionRange(st.a, st.b); } catch (e) { /* not text */ }
+        }
+    }
+
+    function clientToolbar(shown) {
+        var flt = clientFlt();
+        var counts = clientCounts(state.clients);
+        var names = Object.keys(ui.clientSel).sort();
+        var bar = el("div", { cls: "wg-toolbar", attrs: { role: "toolbar", "aria-label": "Client actions" } });
+
+        var acts = el("span", { cls: "wg-actions" });
+        if (!ui.creating)
+            acts.appendChild(button("Create client", "primary sm", function () {
+                ui.creating = true; paintBody();
+            }));
+        bar.appendChild(acts);
+
+        var chips = el("span", { cls: "wg-chips", attrs: { role: "group", "aria-label": "Filter by state" } });
+        CLIENT_FILTERS.forEach(function (f) {
+            var on = flt.status === f.id;
+            var c = button(f.label + " (" + counts[f.id] + ")", "wg-chip" + (on ? " on" : ""), function () {
+                flt.status = f.id; saveClientFlt(); paintBody();
+            });
+            c.className = "wg-chip" + (on ? " on" : "");      /* chip look, not a button look */
+            c.setAttribute("aria-pressed", on ? "true" : "false");
+            chips.appendChild(c);
+        });
+        bar.appendChild(chips);
+
+        var txt = el("input", { cls: "wg-input wg-filter", attrs: { type: "search",
+            placeholder: "Filter: name or IP", "aria-label": "Filter clients by name or tunnel IP",
+            "data-wg-focus": "client-filter",
+            title: "Case-insensitive substring of the client name or tunnel IP, e.g. laptop or 172.16.0." } });
+        txt.value = flt.text;
+        txt.addEventListener("input", function () {
+            flt.text = txt.value; saveClientFlt(); repaintKeepFocus();
+        });
+        bar.appendChild(txt);
+
+        bar.appendChild(el("span", { cls: "wg-subtle wg-toolbar-info",
+            text: "Showing " + shown.length + " of " + state.clients.length }));
+
+        var all = el("input", { cls: "wg-rowcheck", attrs: { type: "checkbox",
+            "aria-label": "Select all shown clients" } });
+        var nShownSel = shown.filter(function (c) { return ui.clientSel[c.name]; }).length;
+        all.checked = shown.length > 0 && nShownSel === shown.length;
+        all.indeterminate = nShownSel > 0 && nShownSel < shown.length;
+        all.addEventListener("change", function () {
+            shown.forEach(function (c) {
+                if (all.checked) ui.clientSel[c.name] = true; else delete ui.clientSel[c.name];
+            });
+            paintBody();
+        });
+        if (shown.length)
+            bar.appendChild(el("label", { cls: "wg-check", title: "Select every client the filter shows" },
+                               all, "Select all shown"));
+
+        var del = button("Delete selected (" + names.length + ")", "danger sm", function () {
+            ui.bulkConfirm = true; paintBody();
+        }, "Tick clients below (or use Select all shown), then delete them in one action.");
+        del.disabled = names.length === 0;
+        bar.appendChild(el("span", { cls: "wg-actions" }, del));
+        return bar;
+    }
+
+    function bulkConfirmBox() {
+        var names = Object.keys(ui.clientSel).sort();
+        var cmds = buildDelClientCommands(names);
+        var first = names.slice(0, 10).join(", ") + (names.length > 10 ? " and " + (names.length - 10) + " more" : "");
+        var box = el("div", { cls: "wg-alert bad wgc-bulk-confirm" },
+            el("h3", { text: "Delete " + names.length + " client" + (names.length === 1 ? "" : "s") + "?" }),
+            el("div", { cls: "wg-subtle", text: first }),
+            el("div", { cls: "wg-hint", text: "Their devices' .conf files stop working immediately. " +
+                "Each client is moved to Recently deleted for " + TRASH_DAYS_UI + " days and can be restored " +
+                "from there; its tunnel IP stays reserved until then." }),
+            el("div", { cls: "wg-subtle", text: "Command to be run:" }),
+            el("pre", { cls: "wg-rules", text: cmds.map(function (c) {
+                return state.binary + " " + c.join(" "); }).join("\n") }));
+        var go = button("Confirm delete " + names.length, "danger", function () {
+            ui.bulkConfirm = false;
+            runBulkDelete(names);
+        });
+        box.appendChild(el("div", { cls: "wgc-actions" }, go,
+            button("Cancel", "", function () { ui.bulkConfirm = false; paintBody(); })));
+        return box;
+    }
+
+    var TRASH_DAYS_UI = 30;
+
+    function runBulkDelete(names) {
+        buildDelClientCommands(names).forEach(function (args, i) {
+            var n = args.length - 1;
+            mutate("bulkdel/" + i + "/" + args[1], args, {
+                ok: "Deleted " + n + " client" + (n === 1 ? "" : "s"),
+                detail: "Moved to Recently deleted for " + TRASH_DAYS_UI + " days.",
+                fail: "Could not delete " + n + " client" + (n === 1 ? "" : "s"),
+                after: function (res) {
+                    var bad = ((res.data && res.data.results) || []).filter(function (x) { return x.ok === false; });
+                    if (bad.length) {
+                        this.warn = true;
+                        this.ok = (n - bad.length) + " of " + n + " clients deleted";
+                        this.detail = bad.slice(0, 10).map(function (x) {
+                            return x.name + ": " + (x.error || "failed"); }).join("\n");
+                    }
+                }
+            });
+        });
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Recently deleted: wg-admin keeps every deleted client / host peer for
+     * TRASH_DAYS_UI days (root-side, /etc/wireguard/trash). This panel lists
+     * the entries (metadata only) with bulk Restore / Delete permanently.
+     * ------------------------------------------------------------------ */
+
+    var trashWatchers = [];     /* host-card panels re-render when trash changes */
+
+    function nowSec() { return Math.floor(Date.now() / 1000); }
+
+    function fmtWhen(sec) {
+        try { return new Date(sec * 1000).toLocaleString(); } catch (e) { return String(sec); }
+    }
+
+    function paintTrash() {
+        if (!dom || !dom.trash) return;
+        clear(dom.trash);
+        if (state.gate) return;
+        dom.trash.appendChild(trashNode({ compact: false }));
+    }
+
+    function repaintTrashNodes() { /* host-card panels are rebuilt by wireguard.js polls */ }
+
+    /*
+     * opts: { iface, compact, onChange }.  compact -> only peer entries of
+     * `iface` (the host interface card); otherwise every entry.
+     */
+    function trashNode(opts) {
+        opts = opts || {};
+        var scope = opts.compact ? "iface:" + opts.iface : "all";
+        var entries = state.trash.filter(function (e) {
+            return opts.compact ? (e.kind === "peer" && e.iface === opts.iface) : true;
+        });
+        var present = Object.create(null);
+        entries.forEach(function (e) { present[e.id] = true; });
+        Object.keys(ui.trashSel).forEach(function (id) {
+            /* only prune ids that vanished from the full list, not just this scope */
+            if (!state.trash.some(function (e) { return e.id === id; })) delete ui.trashSel[id];
+        });
+
+        var det = el("details", { cls: "wg-trash" });
+        if (ui.trashOpen[scope]) det.setAttribute("open", "");
+        det.addEventListener("toggle", function () { ui.trashOpen[scope] = !!det.open; });
+        det.appendChild(el("summary", { text: "Recently deleted (" + entries.length + ")",
+            title: "Deleted clients and peers are kept for " + TRASH_DAYS_UI + " days, then purged." }));
+        var body = el("div", { cls: "wg-trash-body" });
+        det.appendChild(body);
+
+        if (state.trashFault && !state.trash.length) {
+            body.appendChild(el("div", { cls: "wg-inline-err", text:
+                "The deleted-items list could not be read: " + state.trashFault.title }));
+            return det;
+        }
+        if (!entries.length) {
+            body.appendChild(el("div", { cls: "wg-empty", text:
+                "Nothing deleted in the last " + TRASH_DAYS_UI + " days." }));
+            return det;
+        }
+
+        var now = nowSec();
+        var hrow = el("tr");
+        var all = el("input", { cls: "wg-rowcheck", attrs: { type: "checkbox",
+            "aria-label": "Select all recently deleted items shown" } });
+        var nSel = entries.filter(function (e) { return ui.trashSel[e.id]; }).length;
+        all.checked = nSel === entries.length;
+        all.indeterminate = nSel > 0 && nSel < entries.length;
+        all.addEventListener("change", function () {
+            entries.forEach(function (e) {
+                if (all.checked) ui.trashSel[e.id] = true; else delete ui.trashSel[e.id];
+            });
+            rerender();
+        });
+        hrow.appendChild(el("th", { cls: "wg-selcol" }, all));
+        ["Kind", "Name / key", "IP", "Deleted", "Expires"].forEach(function (h) {
+            hrow.appendChild(el("th", { text: h }));
+        });
+        var tbody = el("tbody");
+        entries.forEach(function (e) {
+            var tr = el("tr");
+            var cb = el("input", { cls: "wg-rowcheck", attrs: { type: "checkbox",
+                "aria-label": "Select deleted " + (e.name || e.key) } });
+            cb.checked = !!ui.trashSel[e.id];
+            cb.addEventListener("change", function () {
+                if (cb.checked) ui.trashSel[e.id] = true; else delete ui.trashSel[e.id];
+                rerender();
+            });
+            tr.appendChild(el("td", { cls: "wg-selcol" }, cb));
+            tr.appendChild(el("td", { text: e.kind }));
+            tr.appendChild(el("td", { cls: "mono", text: e.kind === "client" ? e.name
+                : (e.key.length > 20 ? e.key.slice(0, 9) + "…" + e.key.slice(-7) : e.key),
+                title: e.kind === "peer" ? e.key + " on " + e.iface : "" }));
+            tr.appendChild(el("td", { cls: "mono", text: e.ip || "—" }));
+            tr.appendChild(el("td", { cls: "nowrap", text: fmtWhen(e.deletedAt) }));
+            var d = daysLeft(e.expiresAt, now);
+            tr.appendChild(el("td", { cls: "nowrap", text: "in " + d + (d === 1 ? " day" : " days"),
+                title: "purged permanently on " + fmtWhen(e.expiresAt) }));
+            tbody.appendChild(tr);
+        });
+        body.appendChild(el("div", { cls: "wg-table-wrap" },
+            el("table", { cls: "wg-table" }, el("thead", {}, hrow), tbody)));
+
+        var picked = entries.filter(function (e) { return ui.trashSel[e.id]; });
+        var restore = button("Restore selected (" + picked.length + ")", "primary sm", function () {
+            runTrash("restore", picked, opts);
+        }, "Put the selected items back exactly as they were (fails cleanly if the name or IP was reused).");
+        restore.disabled = !picked.length;
+        var ckey = "purge/" + scope;
+        var actions = el("div", { cls: "wgc-actions" }, restore);
+        if (ui.confirm[ckey] && picked.length) {
+            actions.appendChild(el("span", { cls: "wg-subtle", text:
+                "Permanently delete " + picked.length + " item" + (picked.length === 1 ? "" : "s") +
+                "? Keys are shredded and this cannot be undone." }));
+            actions.appendChild(button("Confirm delete permanently", "danger sm", function () {
+                delete ui.confirm[ckey];
+                runTrash("trash-purge", picked, opts);
+            }));
+            actions.appendChild(button("Keep", "sm", function () { delete ui.confirm[ckey]; rerender(); }));
+        } else {
+            var purge = button("Delete permanently (" + picked.length + ")", "danger sm", function () {
+                ui.confirm[ckey] = true; rerender();
+            }, "Shred the selected items now instead of waiting for the " + TRASH_DAYS_UI + "-day expiry.");
+            purge.disabled = !picked.length;
+            actions.appendChild(purge);
+        }
+        body.appendChild(actions);
+        return det;
+
+        function rerender() {
+            if (typeof opts.rerender === "function") opts.rerender(); else paintTrash();
+        }
+    }
+
+    function runTrash(verb, picked, opts) {
+        var ids = picked.map(function (e) { return e.id; });
+        var past = verb === "restore" ? "Restored" : "Permanently deleted";
+        for (var i = 0; i < ids.length; i += BULK_CHUNK) {
+            (function (chunkIds) {
+                var args = [verb].concat(chunkIds);
+                mutate(verb + "/" + chunkIds[0], args, {
+                    ok: past + " " + chunkIds.length + " item" + (chunkIds.length === 1 ? "" : "s"),
+                    fail: (verb === "restore" ? "Could not restore " : "Could not delete ") +
+                          chunkIds.length + " item" + (chunkIds.length === 1 ? "" : "s"),
+                    after: function (res) {
+                        chunkIds.forEach(function (id) { delete ui.trashSel[id]; });
+                        var bad = ((res.data && res.data.results) || []).filter(function (x) { return x.ok === false; });
+                        if (bad.length) {
+                            this.warn = true;
+                            this.ok = (chunkIds.length - bad.length) + " of " + chunkIds.length +
+                                      " items " + (verb === "restore" ? "restored" : "deleted");
+                            this.detail = bad.slice(0, 10).map(function (x) {
+                                return x.id + ": " + (x.error || "failed"); }).join("\n");
+                        }
+                    }
+                }).then(function () {
+                    if (typeof opts.onChange === "function") opts.onChange();
+                });
+            })(ids.slice(i, i + BULK_CHUNK));
+        }
+    }
+
+    /* Run one wg-admin verb through the shared queue; resolves {ok, data|fault}. */
+    var extSeq = 0;
+    function externalMutate(args) {
+        var n = args.length - (args[0] === "peer-remove" ? 2 : 1);
+        var what = (args[0] === "peer-remove") ? "Removed " + n + " peer" + (n === 1 ? "" : "s")
+                 : (args[0] === "del-client")  ? "Deleted " + n + " client" + (n === 1 ? "" : "s")
+                 : args[0] + " done";
+        return mutate("ext/" + (++extSeq), args, {
+            ok: what, detail: /peer-remove|del-client/.test(args[0])
+                ? "Moved to Recently deleted for " + TRASH_DAYS_UI + " days." : "",
+            fail: "wg-admin " + args[0] + " failed"
+        });
+    }
+
+    function clientSummaries() {
+        return state.clients.map(function (c) { return { name: c.name, ip: c.ip }; });
+    }
+
 
     function emptyState() {
         var box = el("div", { cls: "wg-card wgc-empty-card" },
@@ -1558,6 +1971,14 @@
         var open = !!ui.open[client.name];
 
         var head = el("div", { cls: "wg-card-head" });
+        var pick = el("input", { cls: "wg-rowcheck", attrs: { type: "checkbox",
+            "aria-label": "Select client " + client.name } });
+        pick.checked = !!ui.clientSel[client.name];
+        pick.addEventListener("change", function () {
+            if (pick.checked) ui.clientSel[client.name] = true; else delete ui.clientSel[client.name];
+            paintBody();
+        });
+        head.appendChild(pick);
         head.appendChild(el("span", { cls: "name", text: client.name }));
         head.appendChild(el("span", { cls: "mono wgc-ip", text: client.ip || "—",
             title: "tunnel address" }));
@@ -1682,7 +2103,8 @@
         if (ui.confirm[ckey]) {
             row.appendChild(el("span", { cls: "wg-subtle", text:
                 "Delete " + client.name + ", its keys and all " + client.configs.length +
-                " config(s)? The device's current .conf stops working immediately." }));
+                " config(s)? The device's current .conf stops working immediately. " +
+                "It is moved to Recently deleted for " + TRASH_DAYS_UI + " days and can be restored." }));
             row.appendChild(button("Confirm delete client", "danger", function () {
                 delete ui.confirm[ckey];
                 mutate(ckey, ["del-client", client.name], {
@@ -3013,10 +3435,18 @@
     window.WGClient = {
         render: render,
         refresh: refresh,
+        mutate: externalMutate,
+        clients: clientSummaries,
+        trashNode: trashNode,
 
         compute: {
             normaliseCatalogue: normaliseCatalogue,
             normaliseClients: normaliseClients,
+            normaliseTrash: normaliseTrash,
+            daysLeft: daysLeft,
+            clientCounts: clientCounts,
+            filterClients: filterClients,
+            buildDelClientCommands: buildDelClientCommands,
             normaliseRouting: normaliseRouting,
             normaliseSchema: normaliseSchema,
             normaliseIpam: normaliseIpam,

@@ -1,0 +1,20 @@
+# wg-trash-purge.service.in - TEMPLATE, rendered by install.sh like
+# wg-policy-watch.service.in (same @TOKEN@ rules; see that file's header).
+# Destroys deleted clients/peers past their retention (TRASH_DAYS, default 30).
+# Rendered and placed by install.sh, NEVER enabled by it: enable the timer with
+#   systemctl enable --now wg-trash-purge.timer
+# Every locked wg-admin verb also purges expired entries, so the timer only
+# matters on a host where nothing mutates for weeks.
+
+[Unit]
+Description=Purge expired WireGuard trash (deleted clients and peers)
+Documentation=file:@ENV_FILE@
+
+[Service]
+Type=oneshot
+ExecStart=@BIN@/wg-admin trash-purge --expired
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/wireguard
+PrivateTmp=yes

@@ -818,3 +818,33 @@ img.wgc-qr {
 .wgc-file-name { font-weight: 600; font-size: 0.85rem; }
 .wgc-file-mode { font-size: 0.75rem; color: var(--wg-fg-muted); }
 pre.wgc-file-body { max-height: 20rem; overflow: auto; }
+
+/* ---------- bulk select / filter toolbar (above peer + client tables) ---------- */
+.wg-toolbar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem;
+    padding: 0.5rem 1rem; border-top: 1px solid var(--wg-border-soft);
+    background: var(--wg-card-alt);
+}
+.wg-toolbar .wg-actions { display: inline-flex; gap: 0.4rem; flex-wrap: wrap; }
+.wg-toolbar .wg-actions:last-child { margin-left: auto; }
+.wg-toolbar-info { font-size: 0.8rem; white-space: nowrap; }
+.wg-chips { display: inline-flex; flex-wrap: wrap; gap: 0.3rem; }
+.wg-chip {
+    font: inherit; font-size: 0.78rem; padding: 0.12rem 0.6rem; cursor: pointer;
+    border: 1px solid var(--wg-border); border-radius: 999px;
+    background: var(--wg-card); color: var(--wg-fg);
+}
+.wg-chip:hover { background: var(--wg-info-bg); }
+.wg-chip.on { border-color: var(--wg-accent); background: var(--wg-info-bg); color: var(--wg-accent); font-weight: 600; }
+.wg-chip:focus-visible { outline: 2px solid var(--wg-accent); outline-offset: 1px; }
+.wg-filter { width: 15rem; max-width: 100%; }
+.wg-selcol { width: 1.6rem; text-align: center; }
+.wg-rowcheck { cursor: pointer; }
+tr.wg-row-selected td { background: var(--wg-info-bg); }
+
+/* ---------- Recently deleted (trash) ---------- */
+.wg-trash { border-top: 1px solid var(--wg-border-soft); padding: 0.5rem 1rem; }
+.wg-trash > summary { cursor: pointer; font-size: 0.9rem; font-weight: 600; }
+.wg-trash-body { margin-top: 0.5rem; }
+.wg-trash .wg-table-wrap { margin-top: 0.4rem; }
+.wgc-trash-wrap { margin-top: 1rem; }

@@ -1,0 +1,13 @@
+# wg-trash-purge.timer.in - TEMPLATE. Daily trigger for wg-trash-purge.service.
+# Rendered by install.sh, never enabled by it (enable by hand, see the service).
+
+[Unit]
+Description=Daily purge of expired WireGuard trash
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

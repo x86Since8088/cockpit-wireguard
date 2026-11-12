@@ -58,6 +58,20 @@ while the tab is hidden and can be switched off entirely.
 
 ---
 
+## Recently deleted (30-day undelete)
+
+Deleting a client (`wg-admin del-client`, single or several names) or a host
+peer (`wg-admin peer-remove IFACE KEY...`) no longer destroys anything: the data
+is moved into `/etc/wireguard/trash/<id>/` (root, 0700; files 0600) with a
+`meta.json`, and kept for 30 days (`TRASH_DAYS`, overridable only through
+`/etc/wireguard/wg-admin.conf`). A deleted client's tunnel IP stays reserved
+(`ipam-status` lists it under `held`). The page's **Recently deleted** panels
+(Clients section, and one under each host interface) restore (`wg-admin restore
+ID...`) or purge permanently (`wg-admin trash-purge ID...|--all|--expired`).
+Expired entries are purged opportunistically by every locked verb. For a daily
+sweep, `systemd/wg-trash-purge.{service,timer}.in` are rendered and installed
+but NOT enabled; enable with `systemctl enable --now wg-trash-purge.timer`.
+
 ## Safety properties
 
 **It never changes anything.** There is no button, no form and no code path in
