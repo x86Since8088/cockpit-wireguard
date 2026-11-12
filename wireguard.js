@@ -704,6 +704,8 @@
     var tick = 0;
     var timer = null;
     var inFlight = false;
+    var pollPending = false;     /* a forced poll arrived mid-flight: run one more after */
+    var pollGen = 0;             /* generation of the newest poll started */
 
     /* Live-ageing handshake cells, refreshed in place between polls. */
     var ageWidgets = [];
@@ -712,7 +714,7 @@
      * Collection
      * ------------------------------------------------------------------ */
 
-    function collectFast() {
+    function collectFast(gen) {
         return Promise.all([
             probe(CMD.privilege),
             probe(CMD.hostDump),
@@ -721,6 +723,7 @@
             probe(CMD.easyDump),
             probe(CMD.easyPs)
         ]).then(function (r) {
+            if (gen !== pollGen) return;      /* superseded by a newer poll */
             var priv = r[0], dump = r[1], list = r[2], addr = r[3], eDump = r[4], ps = r[5];
 
             state.privileged = priv.ok ? (priv.data.trim() === "0") : null;
@@ -759,13 +762,14 @@
         });
     }
 
-    function collectSlow() {
+    function collectSlow(gen) {
         return Promise.all([
             probe(CMD.units),
             probe(CMD.nm),
             probe(CMD.nat),
             probe(CMD.easyAddr)
         ]).then(function (r) {
+            if (gen !== pollGen) return;      /* superseded by a newer poll */
             var units = r[0], nm = r[1], nat = r[2], eAddr = r[3];
 
             state.units    = units.ok ? parseUnits(units.data) : [];
@@ -782,23 +786,38 @@
     }
 
     /*
-     * Nothing blocks: the previous snapshot stays on screen while commands run,
-     * and an overlapping tick is dropped rather than queued.
+     * Nothing blocks: the previous snapshot stays on screen while commands run.
+     * An overlapping AUTO tick is dropped, but a FORCED poll (issued right after
+     * a mutation, so the page reflects it) must never be lost: its snapshot has
+     * to be taken after the mutation. If one arrives mid-flight, remember it and
+     * run exactly one more forced poll when the current one finishes (trailing
+     * coalesce). The in-flight poll's snapshot pre-dates the mutation, so it is
+     * superseded rather than painted over the removed peer.
      */
     function poll(force) {
-        if (inFlight) return;
+        if (inFlight) {
+            if (force) pollPending = true;
+            return;
+        }
         inFlight = true;
+        pollPending = false;
+        var gen = ++pollGen;
         state.loading = true;
         renderTopbar();
 
-        var jobs = [collectFast()];
-        if (force || tick % SLOW_EVERY === 0) jobs.push(collectSlow());
+        var jobs = [collectFast(gen)];
+        if (force || tick % SLOW_EVERY === 0) jobs.push(collectSlow(gen));
         tick++;
 
         Promise.all(jobs).catch(function (e) {
             console.error("cockpit-wireguard: poll failed", e);   /* probe() never rejects */
         }).then(function () {
             inFlight = false;
+            if (pollPending) {            /* snapshot is stale: skip painting it */
+                pollPending = false;
+                poll(true);
+                return;
+            }
             state.loading = false;
             state.lastUpdate = new Date();
             render();

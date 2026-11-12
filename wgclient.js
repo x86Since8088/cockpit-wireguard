@@ -769,6 +769,29 @@
                            fault.source === "missing");
     }
 
+    /*
+     * A fault that says "try again", not "you cannot use this page": Cockpit
+     * channel hiccups under load (terminated / timeout / disconnected /
+     * internal-error) and wg-admin's own flock timeout while another
+     * mutation holds the lock. These are reported as notices but must never
+     * raise the blocking gate - only a genuine privilege / missing-helper
+     * fault does.
+     */
+    var TRANSIENT_PROBLEMS = { "terminated": 1, "timeout": 1, "disconnected": 1,
+                               "internal-error": 1 };
+    function isTransientFault(fault) {
+        if (!fault) return false;
+        if (fault.source === "cockpit" && TRANSIENT_PROBLEMS[fault.problem]) return true;
+        if (fault.source === "backend" &&
+            /could not acquire|lock|timed out|timeout/i.test(String(fault.detail || "")))
+            return true;
+        return false;
+    }
+    /* Blocking AND genuine: the only faults allowed to set state.gate. */
+    function isGateFault(fault) {
+        return isBlockingFault(fault) && !isTransientFault(fault);
+    }
+
     /* ------------------------------------------------------------------ *
      * Backend
      * ------------------------------------------------------------------ */
@@ -918,18 +941,51 @@
      * Loading
      * ------------------------------------------------------------------ */
 
+    /*
+     * Single-flight refresh with trailing coalescing. Any number of refresh()
+     * calls made while one is in flight cost exactly ONE more refresh after
+     * it; the in-flight result is superseded and NOT applied (its snapshot
+     * pre-dates whatever prompted the newer request), so a slow, stale `list`
+     * can never repaint rows that were since deleted. Every caller's promise
+     * resolves when the refresh that covers it has been applied.
+     */
+    var refreshRunning = false, refreshPending = false, refreshGen = 0;
+    var refreshWaiters = [];
+    var refreshDeferred = false;          /* asked for while mutations were active */
+
     function refresh() {
         if (!dom) return Promise.resolve();
+        return new Promise(function (resolve) {
+            refreshWaiters.push(resolve);
+            /* Mutations in flight or queued: a snapshot taken now would
+               pre-date them. Run one refresh when the queue drains. */
+            if (mutRunning || mutQueue.length) { refreshDeferred = true; return; }
+            if (refreshRunning) { refreshPending = true; return; }
+            runRefresh();
+        });
+    }
+
+    function runRefresh() {
+        refreshRunning = true;
+        refreshPending = false;
+        var gen = ++refreshGen;
         state.loading = true;
         paintStatus();
 
-        return Promise.all([
+        Promise.all([
             callAdmin(["catalogue"]),
             callAdmin(["list"]),
             callAdmin(["routing-status"]),
             callAdmin(["schema"]),
             callAdmin(["ipam-status"])
         ]).then(function (res) {
+            refreshRunning = false;
+            if (refreshPending || gen !== refreshGen || mutRunning || mutQueue.length) {
+                /* Superseded: drop this snapshot. */
+                if (mutRunning || mutQueue.length) { refreshDeferred = true; refreshPending = false; }
+                else runRefresh();
+                return;
+            }
             var c = res[0], l = res[1], r = res[2], s = res[3], ip = res[4];
 
             state.catFault     = c.ok  ? null : c.fault;
@@ -944,14 +1000,19 @@
             if (s.ok)  state.schema  = normaliseSchema(s.data);
             if (ip.ok) state.ipam    = normaliseIpam(ip.data);
 
-            /* One blocking fault gates the whole section; it is the same
-               escalation failing five times, so report it once. */
+            /* One genuine blocking fault gates the whole section; it is the
+               same escalation failing five times, so report it once. A
+               transient fault (lock timeout, channel hiccup) never gates: it
+               is shown as a per-verb notice and the previous data stays. */
             state.gate = [c.fault, l.fault, r.fault, s.fault, ip.fault]
-                             .filter(isBlockingFault)[0] || null;
+                             .filter(isGateFault)[0] || null;
 
             state.loading = false;
             state.loaded = true;
+            var waiters = refreshWaiters;
+            refreshWaiters = [];
             paint();
+            waiters.forEach(function (w) { w(); });
         });
     }
 
@@ -1000,23 +1061,108 @@
      * Mutations. Every verb is idempotent per the contract, so a failed call
      * can simply be repeated. `key` guards against a double click firing the
      * same change twice.
+     *
+     * All mutations share ONE queue: at most one wg-admin mutation is in
+     * flight at a time (wg-admin serialises on a flock anyway; queueing here
+     * stops N concurrent privileged spawns from timing out on that lock).
+     * Queued rows are busy (ui.busy[key] === "queued") until their turn.
+     * When the queue drains, ONE refresh runs, and the burst's outcomes are
+     * reported as one aggregated notice instead of last-writer-wins.
+     *
+     * describe: { ok, detail, fail, after(res) } - after() runs on success.
      */
+    var mutQueue = [];
+    var mutRunning = false;
+    var burst = null;
+
+    function dropOptimistically(args) {
+        var verb = args[0];
+        if (verb === "del-client") {
+            state.clients = state.clients.filter(function (c) { return c.name !== args[1]; });
+        } else if (verb === "del-config") {
+            state.clients.forEach(function (c) {
+                if (c.name === args[1])
+                    c.configs = c.configs.filter(function (cf) { return cf.name !== args[2]; });
+            });
+        }
+    }
+
     function mutate(key, args, describe) {
         if (ui.busy[key]) return Promise.resolve();
-        ui.busy[key] = true;
+        ui.busy[key] = "queued";
         state.notice = null;
         paint();
-
-        return callAdmin(args).then(function (res) {
-            delete ui.busy[key];
-            if (res.ok) {
-                state.notice = { cls: "ok", title: describe.ok, text: describe.detail || "" };
-                return refresh();
-            }
-            state.notice = { cls: "bad", title: describe.fail, fault: res.fault };
-            if (isBlockingFault(res.fault)) state.gate = res.fault;
-            paint();
+        return new Promise(function (resolve) {
+            mutQueue.push({ key: key, args: args, describe: describe, resolve: resolve });
+            pumpMutations();
         });
+    }
+
+    function pumpMutations() {
+        if (mutRunning) return;
+        var it = mutQueue.shift();
+        if (!it) { finishBurst(); return; }
+        if (!burst) burst = { ok: [], bad: [], resolvers: [], verbs: [] };
+        mutRunning = true;
+        ui.busy[it.key] = "running";
+        paintBody();
+
+        callAdmin(it.args).then(function (res) {
+            mutRunning = false;
+            delete ui.busy[it.key];
+            burst.resolvers.push(it.resolve);
+            burst.verbs.push(it.args[0]);
+            if (res.ok) {
+                burst.ok.push(it.describe);
+                dropOptimistically(it.args);
+                if (it.describe.after) it.describe.after(res);
+            } else {
+                burst.bad.push({ describe: it.describe, fault: res.fault });
+                if (isGateFault(res.fault)) state.gate = res.fault;
+            }
+            paint();
+            pumpMutations();
+        });
+    }
+
+    function burstNotice(b) {
+        var n = b.ok.length + b.bad.length;
+        if (n === 1) {
+            return b.bad.length
+                ? { cls: "bad", title: b.bad[0].describe.fail, fault: b.bad[0].fault }
+                : { cls: "ok", title: b.ok[0].ok, text: b.ok[0].detail || "" };
+        }
+        var allDel = b.verbs.every(function (v) { return v === "del-client"; });
+        if (!b.bad.length)
+            return { cls: "ok",
+                     title: allDel ? "Deleted " + n + " clients"
+                                   : n + " changes applied",
+                     text: allDel ? "" : b.ok.map(function (d) { return d.ok; }).join("; ") };
+        return { cls: "bad",
+                 title: b.bad.length + " of " + n + " changes failed" +
+                        (b.ok.length ? " (" + b.ok.length + " applied)" : ""),
+                 text: b.bad.map(function (x) {
+                     return x.describe.fail + ": " + (x.fault && x.fault.title || "failed") +
+                            (x.fault && x.fault.detail ? " - " + x.fault.detail : "");
+                 }).join("\n") };
+    }
+
+    function finishBurst() {
+        if (!burst) return;
+        var b = burst;
+        burst = null;
+        state.notice = burstNotice(b);
+        var done = function () { b.resolvers.forEach(function (r) { r(); }); };
+        if (b.ok.length || refreshDeferred) {
+            refreshDeferred = false;
+            if (!dom) { paint(); done(); return; }
+            refreshWaiters.push(done);       /* resolves with the one refresh */
+            if (refreshRunning) refreshPending = true; else runRefresh();
+            paint();
+        } else {
+            paint();
+            done();
+        }
     }
 
     /* ------------------------------------------------------------------ *
@@ -1225,7 +1371,7 @@
          [state.routingFault, "routing-status"],
          [state.schemaFault, "schema"]].forEach(function (pair) {
             var f = pair[0];
-            if (!f || isBlockingFault(f) || f === state.gate) return;
+            if (!f || isGateFault(f) || f === state.gate) return;
             var box = faultPanel(f, "Retry");
             box.insertBefore(el("div", { cls: "wg-subtle", text: "wg-admin " + pair[1] }),
                              box.firstChild);
@@ -1339,47 +1485,31 @@
     }
 
     /*
-     * Not routed through mutate(): the reply must be inspected for the
-     * contract's exhaustion signal. `reused:true` means the pool was empty
-     * and the least-recently-seen address was handed out again - that gets
-     * the sticky warning banner, never a quiet success line.
+     * Goes through the shared mutation queue. `reused:true` means the pool was
+     * empty and the least-recently-seen address was handed out again - that
+     * gets the sticky warning banner, never a quiet success line.
      */
     function createClient(name, ip) {
-        var key = "new/" + name;
-        if (ui.busy[key]) return Promise.resolve();
-        ui.busy[key] = true;
-        state.notice = null;
-        paint();
-
         var args = ["new-client", name];
         if (ip) args = args.concat(["--ip", ip]);
 
-        return callAdmin(args).then(function (res) {
-            delete ui.busy[key];
-            if (!res.ok) {
-                state.notice = { cls: "bad",
-                                 title: "Could not create client “" + name + "”",
-                                 fault: res.fault };
-                if (isBlockingFault(res.fault)) state.gate = res.fault;
-                paint();
-                return;
+        return mutate("new/" + name, args, {
+            ok: "Client “" + name + "” created",
+            detail: "A key pair was generated on the host. Build a config " +
+                    "for it below to get a .conf file.",
+            fail: "Could not create client “" + name + "”",
+            after: function (res) {
+                ui.creating = false;
+                if (truthy(res.data.reused)) {
+                    state.reusedBanner = {
+                        title: "Address REUSED for “" + name + "”" +
+                               (res.data.ip ? " — " + String(res.data.ip) : ""),
+                        text: String(res.data.warning ||
+                            ("The pool has no free address; the least recently seen one " +
+                             "was reused for this client."))
+                    };
+                }
             }
-
-            ui.creating = false;
-            if (truthy(res.data.reused)) {
-                state.reusedBanner = {
-                    title: "Address REUSED for “" + name + "”" +
-                           (res.data.ip ? " — " + String(res.data.ip) : ""),
-                    text: String(res.data.warning ||
-                        ("The pool has no free address; the least recently seen one " +
-                         "was reused for this client."))
-                };
-            }
-            state.notice = { cls: "ok",
-                             title: "Client “" + name + "” created",
-                             text: "A key pair was generated on the host. Build a config " +
-                                   "for it below to get a .conf file." };
-            return refresh();
         });
     }
 
@@ -1472,6 +1602,10 @@
                 acts.appendChild(button("Keep", "", function () {
                     delete ui.confirm[ckey]; paintBody();
                 }));
+            } else if (ui.busy[ckey]) {
+                var bb = button(ui.busy[ckey] === "queued" ? "Queued…" : "Deleting…", "", function () {});
+                bb.disabled = true;
+                acts.appendChild(bb);
             } else {
                 acts.appendChild(button("Delete", "", function () {
                     ui.confirm[ckey] = true; paintBody();
@@ -1518,6 +1652,10 @@
             row.appendChild(button("Cancel", "", function () {
                 delete ui.confirm[ckey]; paintBody();
             }));
+        } else if (ui.busy[ckey]) {
+            var cb = button(ui.busy[ckey] === "queued" ? "Queued…" : "Deleting…", "", function () {});
+            cb.disabled = true;
+            row.appendChild(cb);
         } else {
             row.appendChild(button("Delete client…", "", function () {
                 ui.confirm[ckey] = true; paintBody();
@@ -2079,7 +2217,7 @@
                 state.notice = { cls: "bad",
                                  title: "Could not enable “" + target + "”",
                                  fault: res.fault };
-                if (isBlockingFault(res.fault)) state.gate = res.fault;
+                if (isGateFault(res.fault)) state.gate = res.fault;
                 paint();
                 return;
             }
@@ -2136,7 +2274,7 @@
                                   truthy(res.data.endpoint_placeholder);
             } else {
                 cur.fault = res.fault;
-                if (isBlockingFault(res.fault)) state.gate = res.fault;
+                if (isGateFault(res.fault)) state.gate = res.fault;
             }
             paint();
         });
@@ -2264,7 +2402,7 @@
                 s.data = normalisePackage(res.data);
             } else {
                 s.fault = res.fault;
-                if (isBlockingFault(res.fault)) state.gate = res.fault;
+                if (isGateFault(res.fault)) state.gate = res.fault;
             }
             paint();
         });
@@ -2633,7 +2771,7 @@
             ui.ipamScan.busy = false;
             if (!res.ok) {
                 ui.ipamScan.fault = res.fault;
-                if (isBlockingFault(res.fault)) { state.gate = res.fault; paint(); return; }
+                if (isGateFault(res.fault)) { state.gate = res.fault; paint(); return; }
                 paintIpam();
                 return;
             }

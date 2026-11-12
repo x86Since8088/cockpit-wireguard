@@ -787,6 +787,155 @@ async function main() {
     ok(["number", "text", "toggle", "select", "radio", "cidr-set", "readonly",
         "password-reveal"].every(c => controls.indexOf(c) >= 0),
        "the fixture exercises all eight documented control types");
+
+    /* ============================================================== */
+    section("9. rapid-delete races: one mutation at a time, coalesced refresh");
+
+    function delay(ms) {
+        return new Promise(resolve => {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, Math.max(1, ms), () => {
+                resolve(); return GLib.SOURCE_REMOVE;
+            });
+        });
+    }
+    function lcg(seed) {           /* deterministic "random" latencies */
+        let x = seed;
+        return () => { x = (x * 1103515245 + 12345) % 2147483648; return x / 2147483648; };
+    }
+    function namesIn(root) {
+        return byClass(root, "name").map(n => textOf(n));
+    }
+    function clientObj(n) {
+        return { name: n, ip: "172.16.0.1" + n.length, enabled: true,
+                 configs: [{ name: "lab", allowed_ips: ["172.16.0.0/24"] }] };
+    }
+
+    /* 9a/9b: ten rapid deletes with random latencies */
+    const names = [];
+    for (let i = 0; i < 10; i++) names.push("peer" + i);
+    const live = new Set(names);
+    const rnd = lcg(42);
+    let inFlightMut = 0, maxInFlightMut = 0, mutSpawns = 0, listSpawns = 0;
+    globalThis.cockpit = {
+        spawn(argv, opts) {
+            calls.push(argv.slice());
+            if (!opts || opts.superuser !== "require") superuserViolations.push(argv.join(" "));
+            const verb = argv[1];
+            const lat = 2 + Math.floor(rnd() * 25);
+            if (verb === "del-client") {
+                mutSpawns++; inFlightMut++;
+                maxInFlightMut = Math.max(maxInFlightMut, inFlightMut);
+                return delay(lat).then(() => {
+                    inFlightMut--; live.delete(argv[2]);
+                    return JSON.stringify({ ok: true });
+                });
+            }
+            if (verb === "list") {
+                listSpawns++;
+                const snap = Array.from(live).map(clientObj);   /* snapshot at call time */
+                return delay(lat).then(() => JSON.stringify({ clients: snap }));
+            }
+            const data = fakeReply(argv);
+            return delay(lat).then(() => JSON.stringify(data));
+        }
+    };
+    WGClient = loadWGClient();
+    const c9 = makeNode("div");
+    WGClient.render(c9, { heading: false });
+    await delay(300);
+    ok(namesIn(c9).filter(n => /^peer/.test(n)).length === 10, "9: ten clients rendered");
+
+    /* open every card (each click repaints, so re-query) */
+    for (let i = 0; i < 10; i++) fire(buttonExact(c9, "Manage")[0], "click");
+    const listBefore = listSpawns;
+    for (let i = 0; i < 10; i++) {
+        fire(buttonExact(c9, "Delete client…")[0], "click");
+        fire(buttonExact(c9, "Confirm delete client")[0], "click");
+    }
+    ok(buttonExact(c9, "Queued…").length + buttonExact(c9, "Deleting…").length === 10,
+       "9: all ten rows show as queued/deleting straight after the burst");
+    await delay(1500);
+    ok(mutSpawns === 10, "9: all ten del-client mutations ran (got " + mutSpawns + ")");
+    ok(maxInFlightMut === 1,
+       "9a: at most 1 wg-admin mutation spawn in flight at a time (max " + maxInFlightMut + ")");
+    ok(listSpawns - listBefore <= 2,
+       "9b: refreshes coalesce: <=2 list reads for the burst (got " + (listSpawns - listBefore) + ")");
+    ok(namesIn(c9).filter(n => /^peer/.test(n)).length === 0,
+       "9: no deleted client is left on screen");
+    ok(textOf(c9).indexOf("Deleted 10 clients") >= 0,
+       "9: one aggregated notice \u201cDeleted 10 clients\u201d, not last-writer-wins");
+
+    /* 9c: a stale list that resolves AFTER a newer one is not applied */
+    let listN = 0;
+    globalThis.cockpit = {
+        spawn(argv, opts) {
+            calls.push(argv.slice());
+            if (argv[1] === "list") {
+                listN++;
+                if (listN === 1)          /* slow + stale */
+                    return delay(120).then(() => JSON.stringify(
+                        { clients: [clientObj("ghost"), clientObj("keeper")] }));
+                return delay(5).then(() => JSON.stringify({ clients: [clientObj("keeper")] }));
+            }
+            return Promise.resolve(JSON.stringify(fakeReply(argv)));
+        }
+    };
+    WGClient = loadWGClient();
+    const c9c = makeNode("div");
+    WGClient.render(c9c, { heading: false, autoload: false });
+    const p1 = WGClient.refresh();
+    await delay(10);
+    const p2 = WGClient.refresh();       /* newer request while the first is in flight */
+    await Promise.all([p1, p2]);
+    await delay(300);
+    ok(namesIn(c9c).indexOf("ghost") < 0,
+       "9c: a stale list resolving after a newer request is not applied (no ghost row)");
+    ok(namesIn(c9c).indexOf("keeper") >= 0, "9c: the newer list is shown");
+
+    /* 9d: lock-timeout / transient faults never raise the blocking gate */
+    const LOCK = "wg-admin: could not acquire /etc/wireguard/.wg-admin.lock within 15s";
+    function faultyCockpit(failList) {
+        return {
+            spawn(argv) {
+                calls.push(argv.slice());
+                if (argv[1] === "del-client")
+                    return Promise.reject({ problem: "", exit_status: 1, message: LOCK });
+                if (argv[1] === "list" && failList)
+                    return Promise.reject(failList);
+                if (argv[1] === "list")
+                    return Promise.resolve(JSON.stringify({ clients: [clientObj("solo")] }));
+                return Promise.resolve(JSON.stringify(fakeReply(argv)));
+            }
+        };
+    }
+    function gated(root) {
+        return textOf(root).indexOf("Administrative access is required") >= 0 ||
+               textOf(root).indexOf("Cockpit could not run the helper") >= 0 && namesIn(root).indexOf("solo") < 0;
+    }
+    globalThis.cockpit = faultyCockpit(null);
+    WGClient = loadWGClient();
+    const c9d = makeNode("div");
+    WGClient.render(c9d, { heading: false });
+    await delay(100);
+    fire(buttonExact(c9d, "Manage")[0], "click");
+    fire(buttonExact(c9d, "Delete client…")[0], "click");
+    fire(buttonExact(c9d, "Confirm delete client")[0], "click");
+    await delay(100);
+    ok(namesIn(c9d).indexOf("solo") >= 0 && !gated(c9d),
+       "9d: a wg-admin lock-timeout on del-client does not gate the page");
+    ok(textOf(c9d).indexOf("could not acquire") >= 0,
+       "9d: the lock-timeout is still reported as a notice");
+
+    globalThis.cockpit = faultyCockpit({ problem: "terminated", message: "" });
+    WGClient = loadWGClient();
+    const c9e = makeNode("div");
+    WGClient.render(c9e, { heading: false });
+    await delay(100);
+    ok(textOf(c9e).indexOf("Try again") < 0 && textOf(c9e).indexOf("Reading client list") < 0 &&
+       byClass(c9e, "wg-alert").length > 0,
+       "9d: a transient Cockpit fault (terminated) on list is a notice, not the blocking gate");
+    ok(textOf(c9e).indexOf("Retry") >= 0,
+       "9d: it renders as the non-blocking per-verb panel (Retry), not the gate (Try again)");
 }
 
 /* ------------------------------------------------------------------ *
