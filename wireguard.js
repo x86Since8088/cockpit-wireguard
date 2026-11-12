@@ -234,40 +234,130 @@
 
     function isPermissionError(msg) { return PERM_RE.test(String(msg || "")); }
 
-    /* Resolves to { ok, data } or { ok:false, error, denied }. Never rejects. */
-    /*
-     * Cockpit reports privilege failures as a `problem` code, not prose, and the
-     * codes are hyphenated ("access-denied") so a prose regex never matches them.
-     * Check the code first; on a privilege/channel failure retry ONCE with
-     * superuser:"require" so the user gets a real authentication prompt instead
-     * of a silent unprivileged downgrade.
-     */
     var DENY_PROBLEMS = { "access-denied": 1, "authentication-failed": 1,
                           "not-authorized": 1, "cancelled": 1 };
     var CHANNEL_PROBLEMS = { "internal-error": 1, "protocol-error": 1,
                              "terminated": 1, "disconnected": 1 };
 
-    function probe(script) {
-        var argv = ["/bin/sh", "-c", script];
+    /*
+     * COCKPIT 360 BRIDGE FD LEAK - read before touching any cockpit.spawn.
+     *
+     * Measured against an unprivileged cockpit-bridge 360-1 (50 spawns each,
+     * `ls /proc/<bridge>/fd | wc -l` before/after):
+     *     err:"message" (also the DEFAULT when err is omitted)   +2 fds / spawn
+     *     err:"out"                                              +1 fd  / spawn
+     *     err:"ignore"                                           +1 fd  / spawn
+     *     pty:true                                               +0 fds / spawn
+     * The bridge never closes the Popen pipe objects of a non-pty stream
+     * channel, so the privileged bridge walks to its 1024-fd limit and every
+     * later spawn fails with problem "internal-error". The pty path hands the
+     * child one pty and closes it, so it is the only option that does not leak.
+     * Every cockpit.spawn in this plugin therefore uses { pty: true,
+     * err: "out" } (tests/unit/no-leaky-spawn-test.js enforces it).
+     *
+     * A pty merges stderr into stdout, rewrites \n to \r\n and reports no
+     * stderr in the close message, so commands run inside shellWrap(): stderr
+     * is folded into stdout explicitly and the exit status is emitted as a
+     * trailing marker line. The spawn itself therefore always "succeeds" at
+     * the Cockpit level when the shell ran, and failures are classified from
+     * the marker, preserving the old err.message / exit-status semantics.
+     */
+    var RC_MARK = "@@RC@@";
 
-        function fail(err) {
-            var problem = (err && err.problem) ? String(err.problem) : "";
-            var msg = (err && (err.message || err.problem)) || String(err);
-            return { ok: false, error: String(msg).trim(),
-                     denied: !!DENY_PROBLEMS[problem] || isPermissionError(msg) };
+    function shellWrap(script) {
+        return "( " + script + "\n) 2>&1; printf '\\n" + RC_MARK + "%s\\n' \"$?\"";
+    }
+
+    /* "out\r\n\n@@RC@@3\n" -> { rc: 3, out: "out" }; rc === null if the marker is absent. */
+    function parseRc(text) {
+        var t = String(text === undefined || text === null ? "" : text).replace(/\r\n/g, "\n");
+        var i = t.lastIndexOf("\n" + RC_MARK);
+        if (i < 0) return { rc: null, out: t };
+        var rc = parseInt(t.slice(i + 1 + RC_MARK.length), 10);
+        return { rc: isNaN(rc) ? null : rc, out: t.slice(0, i) };
+    }
+
+    /* Run argv with stderr folded in; resolves {rc, out}, rejects only on Cockpit failure. */
+    function spawnArgv(argv, superuser) {
+        return cockpit.spawn(["/bin/sh", "-c",
+                              "\"$@\" 2>&1; printf '\\n" + RC_MARK + "%s\\n' \"$?\"", "sh"].concat(argv),
+                             { superuser: superuser, pty: true, err: "out" })
+            .then(parseRc);
+    }
+
+    function coFail(err) {
+        var problem = (err && err.problem) ? String(err.problem) : "";
+        var msg = (err && (err.message || err.problem)) || String(err);
+        return { ok: false, error: String(msg).trim(),
+                 denied: !!DENY_PROBLEMS[problem] || isPermissionError(msg) };
+    }
+
+    /*
+     * Run several independent sections in ONE spawn. Each section's result is
+     * { ok, data } or { ok:false, error, denied } - independent, so one failing
+     * section (say podman missing) never masks the others. Resolves to a map
+     * name -> result; never rejects.
+     */
+    function secMark(name) { return "@@S:" + name + "@@"; }
+
+    function buildSections(sections) {
+        return sections.map(function (s) {
+            return "printf '" + secMark(s[0]) + "\\n'; ( " + s[1] + "\n) 2>&1; " +
+                   "printf '\\n@@E:" + s[0] + ":%s@@\\n' \"$?\"";
+        }).join("\n");
+    }
+
+    function parseSections(text, sections) {
+        var t = String(text === undefined || text === null ? "" : text).replace(/\r\n/g, "\n");
+        var res = Object.create(null);
+        sections.forEach(function (s) {
+            var name = s[0], start = t.indexOf(secMark(name) + "\n");
+            var endRe = new RegExp("\\n@@E:" + name + ":([0-9]+)@@(\\n|$)");
+            if (start < 0) { res[name] = { ok: false, error: "no output from probe", denied: false }; return; }
+            var rest = t.slice(start + secMark(name).length + 1);
+            var m = endRe.exec(rest);
+            if (!m) { res[name] = { ok: false, error: "probe did not finish", denied: false }; return; }
+            var body = rest.slice(0, m.index);
+            if (m[1] === "0") res[name] = { ok: true, data: body };
+            else {
+                var msg = body.trim() || ("exit status " + m[1]);
+                res[name] = { ok: false, error: msg, denied: isPermissionError(msg) };
+            }
+        });
+        return res;
+    }
+
+    function probeSections(sections) {
+        var script = buildSections(sections);
+
+        function failAll(f) {
+            var res = Object.create(null);
+            sections.forEach(function (s) { res[s[0]] = f; });
+            return res;
+        }
+        function anyDenied(res) {
+            return sections.some(function (s) { return !res[s[0]].ok && res[s[0]].denied; });
+        }
+        function run(su) {
+            return cockpit.spawn(["/bin/sh", "-c", script],
+                                 { superuser: su, pty: true, err: "out" })
+                .then(function (out) { return parseSections(out, sections); });
         }
 
-        return cockpit.spawn(argv, { superuser: "try", err: "message" })
-            .then(function (out) {
-                return { ok: true, data: out };
-            }, function (err) {
-                var problem = (err && err.problem) ? String(err.problem) : "";
-                if (!DENY_PROBLEMS[problem] && !CHANNEL_PROBLEMS[problem] &&
-                    !isPermissionError(err && err.message))
-                    return fail(err);
-                return cockpit.spawn(argv, { superuser: "require", err: "message" })
-                    .then(function (out) { return { ok: true, data: out }; }, fail);
-            });
+        return run("try").then(function (res) {
+            /* Unprivileged "try" can silently downgrade: on a permission failure
+               ask once more with "require" so the user gets a real prompt. */
+            if (!anyDenied(res)) return res;
+            return run("require").then(function (res2) { return res2; },
+                                       function () { return res; });
+        }, function (err) {
+            var problem = (err && err.problem) ? String(err.problem) : "";
+            if (!DENY_PROBLEMS[problem] && !CHANNEL_PROBLEMS[problem] &&
+                !isPermissionError(err && err.message))
+                return failAll(coFail(err));
+            return run("require").then(function (r) { return r; },
+                                       function (e2) { return failAll(coFail(e2)); });
+        });
     }
 
     /* ------------------------------------------------------------------ *
@@ -281,8 +371,13 @@
      * submit ends in poll(true), so the page repaints from re-read data.
      * ------------------------------------------------------------------ */
 
+    /* Resolves with the command's output; rejects { message } on a non-zero exit. */
     function runAction(argv) {
-        return cockpit.spawn(argv, { superuser: "try", err: "message" });
+        return spawnArgv(argv, "try").then(function (r) {
+            if (r.rc !== 0)
+                throw { message: r.out.trim() || ("exit status " + r.rc) };
+            return r.out;
+        });
     }
 
     var RE_B64KEY  = "^[A-Za-z0-9+/]{43}=$";
@@ -714,17 +809,27 @@
      * Collection
      * ------------------------------------------------------------------ */
 
+    var FAST_SECTIONS = [
+        ["privilege", CMD.privilege],
+        ["hostDump",  CMD.hostDump],
+        ["hostList",  CMD.hostList],
+        ["hostAddr",  CMD.hostAddr],
+        ["easyDump",  CMD.easyDump],
+        ["easyPs",    CMD.easyPs]
+    ];
+    var SLOW_SECTIONS = [
+        ["units",    CMD.units],
+        ["nm",       CMD.nm],
+        ["nat",      CMD.nat],
+        ["easyAddr", CMD.easyAddr]
+    ];
+
+    /* One spawn per tick (was six); sections fail independently. */
     function collectFast(gen) {
-        return Promise.all([
-            probe(CMD.privilege),
-            probe(CMD.hostDump),
-            probe(CMD.hostList),
-            probe(CMD.hostAddr),
-            probe(CMD.easyDump),
-            probe(CMD.easyPs)
-        ]).then(function (r) {
+        return probeSections(FAST_SECTIONS).then(function (r) {
             if (gen !== pollGen) return;      /* superseded by a newer poll */
-            var priv = r[0], dump = r[1], list = r[2], addr = r[3], eDump = r[4], ps = r[5];
+            var priv = r.privilege, dump = r.hostDump, list = r.hostList, addr = r.hostAddr,
+                eDump = r.easyDump, ps = r.easyPs;
 
             state.privileged = priv.ok ? (priv.data.trim() === "0") : null;
 
@@ -763,14 +868,9 @@
     }
 
     function collectSlow(gen) {
-        return Promise.all([
-            probe(CMD.units),
-            probe(CMD.nm),
-            probe(CMD.nat),
-            probe(CMD.easyAddr)
-        ]).then(function (r) {
+        return probeSections(SLOW_SECTIONS).then(function (r) {
             if (gen !== pollGen) return;      /* superseded by a newer poll */
-            var units = r[0], nm = r[1], nat = r[2], eAddr = r[3];
+            var units = r.units, nm = r.nm, nat = r.nat, eAddr = r.easyAddr;
 
             state.units    = units.ok ? parseUnits(units.data) : [];
             state.unitsErr = units.ok ? null : units.error;
@@ -1394,6 +1494,13 @@
             if (!document.hidden && !inFlight && state.lastUpdate) refreshAges();
         }, 1000);
     }
+
+    /* Pure helpers, exported so the headless gjs tests can drive them. */
+    window.WGPeers = { compute: {
+        buildSections: buildSections,
+        parseSections: parseSections,
+        parseRc: parseRc
+    } };
 
     if (document.readyState === "loading")
         document.addEventListener("DOMContentLoaded", boot);

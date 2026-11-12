@@ -49,6 +49,39 @@ const FIXTURE_TEXT = readFile(SRC_DIR + "/schema-fixture.json");
 JSON.parse(FIXTURE_TEXT);   /* the fixture itself must be valid JSON */
 
 /* ------------------------------------------------------------------ *
+ * pty-wrapper adapter. The shipped page runs wg-admin as
+ *   cockpit.spawn(["/bin/sh","-c",ADMIN_RUN,"sh",bin,verb,...], {pty:true,err:"out"})
+ * (see the FD LEAK note in wgclient.js). The fakes below are written in terms
+ * of the plain argv [bin, verb, ...]; every `globalThis.cockpit = fake`
+ * assignment is routed through this adapter, which unwraps the argv and
+ * re-encodes the fake's resolve/reject the way the shell wrapper would.
+ * ------------------------------------------------------------------ */
+let _cockpit;
+function adaptCockpit(fake) {
+    if (!fake || typeof fake.spawn !== "function") return fake;
+    return {
+        spawn(argv, opts) {
+            if (!(argv[0] === "/bin/sh" && argv[3] === "sh")) return fake.spawn(argv, opts);
+            if (!opts || opts.pty !== true || opts.err === "message" || opts.err === undefined)
+                leakyOpts.push(argv.slice(4).join(" "));
+            return fake.spawn(argv.slice(4), opts).then(
+                out => String(out) + "\n@@ERR@@\n\n@@RC@@0\n",
+                err => {
+                    if (err && err.problem) throw err;       /* a Cockpit-level failure */
+                    return "\n@@ERR@@\n" + ((err && err.message) || "") + "\n@@RC@@" +
+                           ((err && err.exit_status) || 1) + "\n";
+                });
+        }
+    };
+}
+const leakyOpts = [];
+Object.defineProperty(globalThis, "cockpit", {
+    configurable: true,
+    get() { return _cockpit; },
+    set(v) { _cockpit = adaptCockpit(v); }
+});
+
+/* ------------------------------------------------------------------ *
  * Assertion bookkeeping
  * ------------------------------------------------------------------ */
 
@@ -946,6 +979,8 @@ let exitStatus = 0;
 const loop = GLib.MainLoop.new(null, false);
 main().then(() => {
     print("\n---------------------------------------------");
+    ok(leakyOpts.length === 0,
+       "every wg-admin spawn used pty:true + err:\"out\" (leaky: " + leakyOpts.length + ")");
     print("TOTAL: " + passes + " passed, " + fails + " failed");
     if (fails) {
         print("Failed assertions:");

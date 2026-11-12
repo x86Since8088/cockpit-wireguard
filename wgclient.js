@@ -31,8 +31,12 @@
  *
  * ERROR ATTRIBUTION - read this before changing anything below
  * -----------------------------------------------------------
- * Every call is cockpit.spawn(argv, { superuser: "require", err: "message" }).
- * That rejection has two entirely different shapes and conflating them has
+ * Every call spawns ["/bin/sh","-c",ADMIN_RUN,"sh",binary,...args] with
+ * { superuser: "require", pty: true, err: "out" } - see the FD LEAK note at
+ * callAdmin(). The sh wrapper hands stdout through untouched and captures
+ * wg-admin's stderr and exit status into trailing marker lines, which
+ * callAdmin() turns back into the { problem, exit_status, message } shape
+ * below, so classification is unchanged. A Cockpit failure has two entirely different shapes and conflating them has
  * already cost this project hours:
  *
  *   err.problem is a non-empty string
@@ -796,8 +800,34 @@
      * Backend
      * ------------------------------------------------------------------ */
 
+    /*
+     * COCKPIT 360 BRIDGE FD LEAK. A non-pty stream channel leaks pipe fds in
+     * the bridge for every spawn (err:"message" and the default: 2 per spawn;
+     * err:"out"/"ignore": 1; pty:true: 0 - measured, see wireguard.js). A
+     * privileged bridge at its 1024-fd limit fails every spawn with
+     * "internal-error". So wg-admin runs on a pty. A pty merges stderr into
+     * stdout, so the wrapper below keeps them apart itself: stdout flows
+     * through fd 3 untouched, stderr is captured by the shell, and both the
+     * stderr text and the exit status come back as marker lines.
+     */
+    var ADMIN_RUN = "exec 3>&1; e=$(\"$@\" 2>&1 >&3 3>&-); r=$?; exec 3>&-; " +
+                    "printf '\\n@@ERR@@\\n%s\\n@@RC@@%s\\n' \"$e\" \"$r\"";
+
+    /* -> { out, err, rc } or null when the wrapper's markers are missing. */
+    function parseAdminReply(text) {
+        var t = String(text === undefined || text === null ? "" : text).replace(/\r\n/g, "\n");
+        var i = t.lastIndexOf("\n@@ERR@@\n");
+        if (i < 0) return null;
+        var rest = t.slice(i + 9);
+        var j = rest.lastIndexOf("\n@@RC@@");
+        if (j < 0) return null;
+        var rc = parseInt(rest.slice(j + 7), 10);
+        if (isNaN(rc)) return null;
+        return { out: t.slice(0, i), err: rest.slice(0, j), rc: rc };
+    }
+
     function callAdmin(args) {
-        var argv = [state.binary].concat(args);
+        var argv = ["/bin/sh", "-c", ADMIN_RUN, "sh", state.binary].concat(args);
 
         if (!window.cockpit || typeof cockpit.spawn !== "function")
             return Promise.resolve({ ok: false, fault: {
@@ -807,9 +837,20 @@
                         "That is a page loading problem, not a wg-admin problem.",
                 retry: true } });
 
-        return cockpit.spawn(argv, { superuser: "require", err: "message" })
-            .then(function (out) {
-                var text = String(out === undefined || out === null ? "" : out).trim();
+        return cockpit.spawn(argv, { superuser: "require", pty: true, err: "out" })
+            .then(function (raw) {
+                var rep = parseAdminReply(raw);
+                if (!rep)
+                    return { ok: false, fault: classify({ problem: "terminated", message: "" }) };
+                if (rep.rc !== 0) {
+                    /* sh itself could not run the helper: Cockpit's "not-found". */
+                    if ((rep.rc === 127 || rep.rc === 126) &&
+                        /not found|no such file|permission denied/i.test(rep.err))
+                        return { ok: false, fault: classify({ problem: "not-found", message: "" }) };
+                    return { ok: false, fault: classify({ problem: "", exit_status: rep.rc,
+                                                          message: rep.err }) };
+                }
+                var text = rep.out.trim();
                 var data;
                 try { data = JSON.parse(text || "null"); }
                 catch (e) { return { ok: false, fault: malformedFault(text.length) }; }
