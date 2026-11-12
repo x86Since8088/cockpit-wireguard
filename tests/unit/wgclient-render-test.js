@@ -969,6 +969,100 @@ async function main() {
        "9d: a transient Cockpit fault (terminated) on list is a notice, not the blocking gate");
     ok(textOf(c9e).indexOf("Retry") >= 0,
        "9d: it renders as the non-blocking per-verb panel (Retry), not the gate (Try again)");
+
+    /* ============================================================== */
+    section("10. client bulk select / filter / batch delete + Recently deleted");
+    {
+        const NOWS = Math.floor(Date.now() / 1000);
+        let cl = [];
+        ["alice", "bob", "carol", "dave"].forEach((n, i) =>
+            cl.push({ name: n, ip: "172.16.0." + (10 + i), enabled: n !== "dave",
+                      configs: n === "carol" ? [] : [{ name: "lab", allowed_ips: ["172.16.0.0/24"] }] }));
+        let trash = [
+            { id: "20261110-peer-AAAA", kind: "peer", name: "", ip: "172.16.0.50/32", iface: "wg0",
+              public_key: "PEERKEYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", deleted_at: NOWS - 86400,
+              expires_at: NOWS + 29 * 86400 },
+            { id: "20261109-zed", kind: "client", name: "zed", ip: "172.16.0.60", iface: "wg0",
+              deleted_at: NOWS - 3 * 86400, expires_at: NOWS + 27 * 86400 }
+        ];
+        const mutCalls = [];
+        globalThis.cockpit = {
+            spawn(argv, opts) {
+                calls.push(argv.slice());
+                const verb = argv[1];
+                if (verb === "list") return Promise.resolve(JSON.stringify({ clients: cl }));
+                if (verb === "trash-list") return Promise.resolve(JSON.stringify({ retention_days: 30, entries: trash }));
+                if (verb === "del-client") {
+                    mutCalls.push(argv.slice(1));
+                    const gone = argv.slice(2);
+                    cl = cl.filter(c => gone.indexOf(c.name) < 0);
+                    return Promise.resolve(JSON.stringify({ results: gone.map(n => ({ name: n, ok: true })), deleted: gone.length, failed: 0 }));
+                }
+                if (verb === "restore" || verb === "trash-purge") {
+                    mutCalls.push(argv.slice(1));
+                    const ids = argv.slice(2);
+                    trash = trash.filter(e => ids.indexOf(e.id) < 0);
+                    return Promise.resolve(JSON.stringify({ results: ids.map(i => ({ id: i, ok: verb === "restore" ? i !== "BAD" : true })) }));
+                }
+                return Promise.resolve(JSON.stringify(fakeReply(argv)));
+            }
+        };
+        WGClient = loadWGClient();
+        const c10 = makeNode("div");
+        WGClient.render(c10, { heading: false });
+        await flush(12);
+        const chip = re => all(c10, n => n.tag === "button" && re.test(n.textContent))[0];
+        ok(!!chip(/^All \(4\)$/) && !!chip(/^Enabled \(3\)$/) && !!chip(/^Disabled \(1\)$/) && !!chip(/^No configs \(1\)$/),
+           "10: state chips carry counts");
+        const tb = byClass(c10, "wg-toolbar")[0];
+        ok(!!tb && !!buttonExact(tb, "Create client")[0], "10: actions live in a toolbar above the cards");
+
+        fire(chip(/^Enabled/), "click");
+        ok(namesIn(c10).filter(n => /^(alice|bob|carol|dave)$/.test(n)).length === 3, "10: Enabled filter shows 3 clients");
+        const selAll = all(c10, n => n.tag === "input" && n.attrs["aria-label"] === "Select all shown clients")[0];
+        selAll.checked = true; fire(selAll, "change");
+        ok(buttonExact(c10, "Delete selected (3)").length === 1, "10: select-all-shown selects only the 3 shown (dave excluded)");
+
+        fire(buttonExact(c10, "Delete selected (3)")[0], "click");
+        const box = byClass(c10, "wgc-bulk-confirm")[0];
+        ok(!!box && /alice, bob, carol/.test(textOf(box)) && /wg-admin del-client alice bob carol/.test(textOf(box)),
+           "10: confirm shows the names and the exact single command");
+        ok(/Recently deleted for 30 days/.test(textOf(box)), "10: confirm says the clients go to Recently deleted");
+        fire(buttonExact(c10, "Confirm delete 3")[0], "click");
+        await flush(20);
+        ok(mutCalls.length === 1 && mutCalls[0].join(" ") === "del-client alice bob carol",
+           "10: ONE del-client call carries all three names");
+
+        section("10b. Recently deleted panel");
+        const det = byClass(c10, "wg-trash")[0];
+        ok(!!det && /Recently deleted \(2\)/.test(textOf(det)), "10b: panel lists both entries");
+        ok(/in 29 days/.test(textOf(det)) && /in 27 days/.test(textOf(det)), "10b: shows days until expiry");
+        const rows = all(det, n => n.tag === "input" && /^Select deleted/.test(n.attrs["aria-label"] || ""));
+        rows[0].checked = true; fire(rows[0], "change");
+        const det2 = byClass(c10, "wg-trash")[0];
+        fire(buttonExact(det2, "Restore selected (1)")[0], "click");
+        await flush(20);
+        ok(mutCalls[1] && mutCalls[1][0] === "restore" && mutCalls[1].length === 2, "10b: Restore selected -> one restore call");
+        ok(/Recently deleted \(1\)/.test(textOf(byClass(c10, "wg-trash")[0])), "10b: restored entry leaves the panel after refresh");
+        const rows2 = all(byClass(c10, "wg-trash")[0], n => n.tag === "input" && /^Select deleted/.test(n.attrs["aria-label"] || ""));
+        rows2[0].checked = true; fire(rows2[0], "change");
+        fire(buttonExact(byClass(c10, "wg-trash")[0], "Delete permanently (1)")[0], "click");
+        ok(buttonExact(byClass(c10, "wg-trash")[0], "Confirm delete permanently").length === 1, "10b: permanent delete needs a confirm step");
+        fire(buttonExact(byClass(c10, "wg-trash")[0], "Confirm delete permanently")[0], "click");
+        await flush(20);
+        ok(mutCalls[2] && mutCalls[2][0] === "trash-purge", "10b: confirm -> trash-purge");
+
+        /* compact host panel shows only that interface's peer entries */
+        trash = [trash[0] || { id: "p1", kind: "peer", name: "", ip: "172.16.0.50/32", iface: "wg0",
+                 public_key: "KEY=", deleted_at: NOWS, expires_at: NOWS + 30 * 86400 },
+                 { id: "p2", kind: "peer", name: "", ip: "10.0.0.1/32", iface: "wg1", public_key: "K2=",
+                   deleted_at: NOWS, expires_at: NOWS + 30 * 86400 },
+                 { id: "c1", kind: "client", name: "cx", ip: "172.16.0.9", iface: "wg0",
+                   deleted_at: NOWS, expires_at: NOWS + 30 * 86400 }];
+        await WGClient.refresh();
+        const compact = WGClient.trashNode({ iface: "wg0", compact: true });
+        ok(/Recently deleted \(1\)/.test(textOf(compact)), "10c: host-card panel counts only that interface's peer entries");
+    }
 }
 
 /* ------------------------------------------------------------------ *

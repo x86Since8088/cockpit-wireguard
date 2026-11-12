@@ -373,6 +373,7 @@
 
     /* Resolves with the command's output; rejects { message } on a non-zero exit. */
     function runAction(argv) {
+        if (argv[0] === WG_ADMIN) return adminRun(argv.slice(1));
         return spawnArgv(argv, "try").then(function (r) {
             if (r.rc !== 0)
                 throw { message: r.out.trim() || ("exit status " + r.rc) };
@@ -438,17 +439,181 @@
         };
     }
 
+    var WG_ADMIN   = "/usr/local/sbin/wg-admin";
+    var TRASH_DAYS = 30;
+    var BULK_CHUNK = 100;           /* peers / clients per command */
+
+    var TRASH_NOTE = "Moved to Recently deleted for " + TRASH_DAYS + " days: you can restore it " +
+        "from the Recently deleted panel until then.";
+
+    /* Removal goes through wg-admin so the peer is snapshotted into the trash
+       first; wg-admin then runs the same runtime-only `wg set ... remove`. */
     function peerRemoveSchema(ifaceName, publicKey) {
         return {
             title: "Remove peer from " + ifaceName,
-            intro: "The peer's tunnel stops working immediately. " + PERSIST_NOTE,
+            intro: "The peer's tunnel stops working immediately. " + TRASH_NOTE + " " + PERSIST_NOTE,
             fields: [],
             danger: true,
             submitLabel: "Remove peer",
             build: function () {
-                return [["wg", "set", ifaceName, "peer", publicKey, "remove"]];
+                return [[WG_ADMIN, "peer-remove", ifaceName, publicKey]];
             }
         };
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Bulk select + filter - pure helpers (exported for the gjs tests)
+     * ------------------------------------------------------------------ */
+
+    var STATUS_FILTERS = [
+        { id: "all",   label: "All" },
+        { id: "ok",    label: "Connected" },
+        { id: "stale", label: "Stale" },
+        { id: "never", label: "Never connected" }
+    ];
+
+    function peerKind(p) { return handshakeHealth(p.handshake).kind; }
+
+    function filterCounts(peers) {
+        var c = { all: peers.length, ok: 0, stale: 0, never: 0 };
+        peers.forEach(function (p) { c[peerKind(p)]++; });
+        return c;
+    }
+
+    /* flt = { status: all|ok|stale|never, text } ; text matches key, endpoint or allowed IP. */
+    function filterPeers(peers, flt) {
+        var st = (flt && flt.status) || "all";
+        var q = String((flt && flt.text) || "").trim().toLowerCase();
+        return peers.filter(function (p) {
+            if (st !== "all" && peerKind(p) !== st) return false;
+            if (!q) return true;
+            return String(p.publicKey || "").toLowerCase().indexOf(q) >= 0 ||
+                   String(p.endpoint || "").toLowerCase().indexOf(q) >= 0 ||
+                   p.allowedIps.some(function (ip) { return ip.toLowerCase().indexOf(q) >= 0; });
+        });
+    }
+
+    /* sel: key -> true. Returns the selected keys that are present in `peers`. */
+    function pruneSelection(sel, peers) {
+        var present = Object.create(null);
+        peers.forEach(function (p) { present[p.publicKey] = true; });
+        Object.keys(sel).forEach(function (k) { if (!present[k]) delete sel[k]; });
+        return sel;
+    }
+
+    /* "Select all shown": touches ONLY the given (visible) peers. */
+    function setAllShown(sel, shown, checked) {
+        shown.forEach(function (p) {
+            if (checked) sel[p.publicKey] = true; else delete sel[p.publicKey];
+        });
+        return sel;
+    }
+
+    function selectedKeys(sel) {
+        return Object.keys(sel).filter(function (k) { return sel[k]; }).sort();
+    }
+
+    function chunk(list, n) {
+        var out = [];
+        for (var i = 0; i < list.length; i += n) out.push(list.slice(i, i + n));
+        return out;
+    }
+
+    /* A wg-admin client owns a peer when its tunnel IP is that peer's /32. */
+    function matchClients(peers, clients) {
+        var byIp = Object.create(null);
+        (clients || []).forEach(function (c) { if (c.ip) byIp[c.ip + "/32"] = c; });
+        var matched = [], unmatched = [], seen = Object.create(null);
+        peers.forEach(function (p) {
+            var hit = null;
+            for (var i = 0; i < p.allowedIps.length && !hit; i++)
+                if (byIp[p.allowedIps[i]]) hit = byIp[p.allowedIps[i]];
+            if (hit && !seen[hit.name]) { seen[hit.name] = true; matched.push({ key: p.publicKey, client: hit.name }); }
+            else if (hit) matched.push({ key: p.publicKey, client: hit.name });
+            else unmatched.push(p.publicKey);
+        });
+        return { matched: matched, unmatched: unmatched };
+    }
+
+    /*
+     * The exact commands for a bulk removal. With alsoClients, peers owned by a
+     * wg-admin client are deleted persistently with `del-client` (one call per
+     * BULK_CHUNK names); the rest use the runtime `peer-remove`.
+     */
+    function buildBulkCommands(iface, peers, clients, alsoClients) {
+        var m = matchClients(peers, alsoClients ? clients : []);
+        var names = [];
+        m.matched.forEach(function (x) { if (names.indexOf(x.client) < 0) names.push(x.client); });
+        var cmds = [];
+        chunk(names, BULK_CHUNK).forEach(function (c) {
+            cmds.push([WG_ADMIN, "del-client"].concat(c));
+        });
+        chunk(m.unmatched, BULK_CHUNK).forEach(function (c) {
+            cmds.push([WG_ADMIN, "peer-remove", iface].concat(c));
+        });
+        return cmds;
+    }
+
+    function keySummary(keys) {
+        var first = keys.slice(0, 10).map(truncKey).join("\n");
+        return keys.length > 10 ? first + "\nand " + (keys.length - 10) + " more" : first;
+    }
+
+    function bulkRemoveSchema(iface, peers, clients) {
+        var m = matchClients(peers, clients);
+        var keys = peers.map(function (p) { return p.publicKey; });
+        var fields = [];
+        if (m.matched.length)
+            fields.push({ id: "alsoClients", label: "Also delete matching wg-admin clients (persistent)",
+                          type: "bool", value: true,
+                          help: m.matched.length + " of " + keys.length + " selected peers belong to a " +
+                                "wg-admin client (tunnel IP = the peer's /32). Those are deleted through " +
+                                "wg-admin, which also removes their netplan entry so they stay gone; " +
+                                "the rest are removed at runtime only." });
+        var extra = [
+            el("div", { cls: "wg-subtle", text: keys.length + " peer" + (keys.length === 1 ? "" : "s") +
+                                               " on " + iface + ":" }),
+            el("pre", { cls: "wg-rules", text: keySummary(keys) })
+        ];
+        return {
+            title: "Remove " + keys.length + " peer" + (keys.length === 1 ? "" : "s") + " from " + iface,
+            intro: "These peers' tunnels stop working immediately. " + TRASH_NOTE + " " + PERSIST_NOTE,
+            extra: extra,
+            fields: fields,
+            danger: true,
+            submitLabel: "Remove " + keys.length + " peer" + (keys.length === 1 ? "" : "s"),
+            build: function (v) {
+                return buildBulkCommands(iface, peers, clients, !!v.alsoClients);
+            }
+        };
+    }
+
+    /* Run a wg-admin verb through the Clients module's shared mutation queue
+       (so the Clients list refreshes too); falls back to a direct call. */
+    function adminRun(args) {
+        if (window.WGClient && typeof WGClient.mutate === "function")
+            return WGClient.mutate(args).then(function (res) {
+                if (!res.ok)
+                    throw { message: (res.fault.title || "failed") +
+                                     (res.fault.detail ? ": " + res.fault.detail : "") };
+                return reportResults(res.data);
+            });
+        return spawnArgv([WG_ADMIN].concat(args), "require").then(function (r) {
+            if (r.rc !== 0) throw { message: r.out.trim() || ("exit status " + r.rc) };
+            var data; try { data = JSON.parse(r.out.trim()); } catch (e) { data = null; }
+            return reportResults(data);
+        });
+    }
+
+    /* A verb that ran can still have refused individual items. */
+    function reportResults(data) {
+        var bad = ((data && data.results) || []).filter(function (x) { return x.ok === false; });
+        if (bad.length)
+            throw { message: bad.length + " item(s) failed, the rest were applied:\n" +
+                    bad.slice(0, 10).map(function (x) {
+                        return (x.name || x.key || x.id) + ": " + (x.error || "failed");
+                    }).join("\n") };
+        return data;
     }
 
     /*
@@ -547,8 +712,19 @@
 
             var label = el("label", {}, f.label,
                 f.required ? el("span", { cls: "wg-req", text: "*" }) : "");
+            if (f.type === "bool") label = null;
 
             var control;
+            if (f.type === "bool") {
+                control = el("input", { attrs: { type: "checkbox" } });
+                control.checked = !!f.value;
+                getters[f.id] = function () { return !!control.checked; };
+                control.addEventListener("change", updatePreview);
+                var cb = el("label", { cls: "wg-check" }, control, f.label);
+                wrap.appendChild(cb);
+                if (f.help) wrap.appendChild(el("div", { cls: "wg-fhelp", text: f.help }));
+                return wrap;
+            }
             if (f.type === "list") {
                 control = el("textarea", { cls: "wg-textarea",
                     attrs: { rows: "3", placeholder: f.placeholder || "" } });
@@ -567,7 +743,7 @@
             }
             control.addEventListener("input", updatePreview);
 
-            wrap.appendChild(label);
+            if (label) wrap.appendChild(label);
             wrap.appendChild(control);
             if (f.help) wrap.appendChild(el("div", { cls: "wg-fhelp", text: f.help }));
             wrap.appendChild(errNodes[f.id]);
@@ -597,13 +773,14 @@
                 var msg = (err && (err.message || err.problem)) || String(err);
                 submitBtn.disabled = false;
                 clear(busyNote);
+                poll(true);                 /* a partial batch may have changed things */
                 var box = el("div", { cls: "wg-alert bad" });
                 box.appendChild(el("h3", { text: isPermissionError(msg)
                     ? "Administrative access required"
                     : "The command failed" }));
                 box.appendChild(el("div", { cls: "wg-subtle", text: isPermissionError(msg)
                     ? "wg set needs root and it was not granted, so nothing was changed."
-                    : "Nothing was changed. wg reported:" }));
+                    : "wg reported:" }));
                 box.appendChild(el("pre", { cls: "wg-rules", text: String(msg).trim() }));
                 errBox.appendChild(box);
             });
@@ -618,6 +795,7 @@
 
         var body = el("div", { cls: "wg-modal-body" });
         if (schema.intro) body.appendChild(el("p", { cls: "wg-hint", text: schema.intro }));
+        (schema.extra || []).forEach(function (n) { body.appendChild(n); });
         if (schema.fields.length) {
             var grid = el("div", { cls: "wg-form-grid" });
             schema.fields.forEach(function (f) { grid.appendChild(fieldNode(f)); });
@@ -1027,7 +1205,7 @@
         box.appendChild(tile(fmtBytes(tx), "Sent"));
     }
 
-    function peerTable(peers, ifaceName, managed) {
+    function peerTable(peers, ifaceName, managed, bulkCtx) {
         if (!peers.length)
             return el("div", { cls: "wg-empty", text: "No peers configured on this interface." });
 
@@ -1036,6 +1214,20 @@
         var headers = ["Peer public key", "Status", "Last handshake", "Endpoint", "Allowed IPs",
                        "Received", "Sent", "Keepalive", "PSK"];
         if (managed) headers.push("Actions");
+        if (bulkCtx) {
+            var allBox = el("input", { cls: "wg-rowcheck",
+                attrs: { type: "checkbox", "aria-label": "Select all shown peers",
+                         "data-wg-focus": "selall:" + ifaceName,
+                         title: "Select all peers shown by the current filter" } });
+            var nSel = peers.filter(function (p) { return bulkCtx.sel[p.publicKey]; }).length;
+            allBox.checked = nSel === peers.length && nSel > 0;
+            allBox.indeterminate = nSel > 0 && nSel < peers.length;
+            allBox.addEventListener("change", function () {
+                setAllShown(bulkCtx.sel, peers, allBox.checked);
+                bulkCtx.changed();
+            });
+            hrow.appendChild(el("th", { cls: "wg-selcol" }, allBox));
+        }
         headers.forEach(function (h) {
             hrow.appendChild(el("th", { text: h }));
         });
@@ -1052,6 +1244,18 @@
         }).forEach(function (p) {
             var h = handshakeHealth(p.handshake);
             var tr = el("tr", { cls: "peer-" + h.kind });
+
+            if (bulkCtx) {
+                var rowBox = el("input", { cls: "wg-rowcheck",
+                    attrs: { type: "checkbox", "aria-label": "Select peer " + truncKey(p.publicKey) } });
+                rowBox.checked = !!bulkCtx.sel[p.publicKey];
+                rowBox.addEventListener("change", function () {
+                    if (rowBox.checked) bulkCtx.sel[p.publicKey] = true;
+                    else delete bulkCtx.sel[p.publicKey];
+                    bulkCtx.changed();
+                });
+                tr.appendChild(el("td", { cls: "wg-selcol" }, rowBox));
+            }
 
             tr.appendChild(el("td", {}, keyNode(p.publicKey)));
 
@@ -1126,6 +1330,129 @@
         return pill(up ? "up" : "down", up ? "ok" : "bad");
     }
 
+    /* ------------------------------------------------------------------ *
+     * Peer toolbar: actions + filter + bulk select, ABOVE the table
+     * ------------------------------------------------------------------ */
+
+    var bulk = { sel: Object.create(null), flt: Object.create(null) };   /* by iface */
+
+    function lsGet(k) { try { return window.localStorage.getItem(k); } catch (e) { return null; } }
+    function lsSet(k, v) { try { window.localStorage.setItem(k, v); } catch (e) { /* blocked */ } }
+
+    function fltFor(ifaceName) {
+        var f = bulk.flt[ifaceName];
+        if (!f) {
+            f = { status: "all", text: "" };
+            try {
+                var saved = JSON.parse(lsGet("wg:peerfilter:" + ifaceName) || "null");
+                if (saved && typeof saved === "object") {
+                    if (STATUS_FILTERS.some(function (x) { return x.id === saved.status; }))
+                        f.status = saved.status;
+                    if (typeof saved.text === "string") f.text = saved.text.slice(0, 200);
+                }
+            } catch (e) { /* ignore corrupt value */ }
+            bulk.flt[ifaceName] = f;
+        }
+        return f;
+    }
+
+    function saveFlt(ifaceName) {
+        lsSet("wg:peerfilter:" + ifaceName, JSON.stringify(fltFor(ifaceName)));
+    }
+
+    function selFor(ifaceName) {
+        return bulk.sel[ifaceName] || (bulk.sel[ifaceName] = Object.create(null));
+    }
+
+    /* Peers visible under the current filter; the selection is trimmed to
+       peers that still exist AND are still shown (a poll can move a peer
+       between statuses). Selection survives the 5 s repaint: it lives here,
+       keyed by public key, not in the DOM. */
+    function shownPeers(iface) {
+        var shown = filterPeers(iface.peers, fltFor(iface.name));
+        var sel = selFor(iface.name);
+        pruneSelection(sel, shown);
+        return shown;
+    }
+
+    function bulkCtxFor(iface) {
+        return { sel: selFor(iface.name), changed: function () { renderHost(); } };
+    }
+
+    function peerToolbar(iface) {
+        var flt = fltFor(iface.name);
+        var counts = filterCounts(iface.peers);
+        var sel = selFor(iface.name);
+        pruneSelection(sel, filterPeers(iface.peers, flt));
+        var nSel = selectedKeys(sel).length;
+        var bar = el("div", { cls: "wg-toolbar", attrs: { role: "toolbar",
+                                                          "aria-label": "Peer actions for " + iface.name } });
+
+        var addBtn = el("button", { cls: "wg-btn primary sm", attrs: { type: "button" }, text: "Add peer" });
+        addBtn.addEventListener("click", function () { schemaForm(peerAddSchema(iface.name)); });
+        var portBtn = el("button", { cls: "wg-btn sm", attrs: { type: "button" }, text: "Set port" });
+        portBtn.addEventListener("click", function () { schemaForm(listenPortSchema(iface)); });
+        bar.appendChild(el("span", { cls: "wg-actions" }, addBtn, portBtn));
+
+        if (!iface.peers.length) return bar;
+
+        var chips = el("span", { cls: "wg-chips", attrs: { role: "group", "aria-label": "Filter by status" } });
+        STATUS_FILTERS.forEach(function (f) {
+            var on = flt.status === f.id;
+            var c = el("button", { cls: "wg-chip" + (on ? " on" : ""),
+                attrs: { type: "button", "aria-pressed": on ? "true" : "false",
+                         title: f.id === "never" ? "Peers that have never completed a handshake"
+                              : f.id === "stale" ? "Last handshake more than " + Math.round(STALE_SECS / 60) + " minutes ago"
+                              : f.id === "ok" ? "Handshake within " + Math.round(STALE_SECS / 60) + " minutes"
+                              : "Every peer" },
+                text: f.label + " (" + counts[f.id] + ")" });
+            c.addEventListener("click", function () {
+                flt.status = f.id; saveFlt(iface.name); renderHost();
+            });
+            chips.appendChild(c);
+        });
+        bar.appendChild(chips);
+
+        var txt = el("input", { cls: "wg-input wg-filter",
+            attrs: { type: "search", placeholder: "Filter: key, endpoint or IP",
+                     "aria-label": "Filter peers by public key, endpoint or allowed IP",
+                     "data-wg-focus": "filter:" + iface.name,
+                     title: "Case-insensitive substring of the public key, the endpoint or an allowed IP, " +
+                            "e.g. 172.16.0.1 or 203.0.113." } });
+        txt.value = flt.text;
+        txt.addEventListener("input", function () {
+            flt.text = txt.value; saveFlt(iface.name); renderHost();
+        });
+        bar.appendChild(txt);
+
+        var shown = filterPeers(iface.peers, flt);
+        var info = el("span", { cls: "wg-subtle wg-toolbar-info",
+            text: "Showing " + shown.length + " of " + iface.peers.length });
+        bar.appendChild(info);
+
+        if (flt.status !== "all" || flt.text) {
+            var clr = el("button", { cls: "wg-btn sm", attrs: { type: "button" }, text: "Clear filter" });
+            clr.addEventListener("click", function () {
+                flt.status = "all"; flt.text = ""; saveFlt(iface.name); renderHost();
+            });
+            bar.appendChild(clr);
+        }
+
+        var rm = el("button", { cls: "wg-btn danger sm", attrs: { type: "button" },
+            text: "Remove selected (" + nSel + ")",
+            title: "Select rows with the checkboxes below (the header box selects every row shown)." });
+        rm.disabled = nSel === 0;
+        rm.addEventListener("click", function () {
+            var keys = selectedKeys(sel);
+            var peers = iface.peers.filter(function (p) { return keys.indexOf(p.publicKey) >= 0; });
+            var clients = (window.WGClient && typeof WGClient.clients === "function")
+                ? WGClient.clients() : [];
+            schemaForm(bulkRemoveSchema(iface.name, peers, clients));
+        });
+        bar.appendChild(el("span", { cls: "wg-actions" }, rm));
+        return bar;
+    }
+
     function interfaceCard(iface, link, extras, managed) {
         var card = el("div", { cls: "wg-card" });
 
@@ -1141,22 +1468,6 @@
         if (n && bad) head.appendChild(pill(bad + " needing attention", "warn"));
         else if (n)   head.appendChild(pill("all peers healthy", "ok"));
 
-        if (managed) {
-            var actions = el("span", { cls: "wg-actions" });
-            var addBtn = el("button", { cls: "wg-btn primary sm",
-                                        attrs: { type: "button" }, text: "Add peer" });
-            addBtn.addEventListener("click", function () {
-                schemaForm(peerAddSchema(iface.name));
-            });
-            var portBtn = el("button", { cls: "wg-btn sm",
-                                         attrs: { type: "button" }, text: "Set port" });
-            portBtn.addEventListener("click", function () {
-                schemaForm(listenPortSchema(iface));
-            });
-            actions.appendChild(addBtn);
-            actions.appendChild(portBtn);
-            head.appendChild(actions);
-        }
         card.appendChild(head);
 
         var dl = el("dl", { cls: "wg-dl" });
@@ -1176,7 +1487,16 @@
         (extras || []).forEach(function (e) { row(e[0], e[1]); });
 
         card.appendChild(el("div", { cls: "wg-card-body" }, dl));
-        card.appendChild(peerTable(iface.peers, iface.name, managed));
+        if (managed) {
+            card.appendChild(peerToolbar(iface));
+            card.appendChild(peerTable(shownPeers(iface), iface.name, managed, bulkCtxFor(iface)));
+            if (window.WGClient && typeof WGClient.trashNode === "function")
+                card.appendChild(WGClient.trashNode({ iface: iface.name, compact: true,
+                                                      rerender: renderHost,
+                                                      onChange: function () { poll(true); } }));
+        } else {
+            card.appendChild(peerTable(iface.peers, iface.name, managed));
+        }
         return card;
     }
 
@@ -1192,6 +1512,35 @@
     }
 
     function renderHost() {
+        var focus = captureFocus();
+        renderHostInner();
+        restoreFocus(focus);
+    }
+
+    /* The 5 s repaint rebuilds the DOM; keep the caret in the filter box. */
+    function captureFocus() {
+        var ae = document.activeElement;
+        if (!ae || !ae.getAttribute) return null;
+        var id = ae.getAttribute("data-wg-focus");
+        return id ? { id: id, start: ae.selectionStart, end: ae.selectionEnd } : null;
+    }
+
+    function restoreFocus(f) {
+        if (!f) return;
+        var box = $("wg-host-body");
+        var found = null;
+        (function walk(n) {
+            if (found || !n) return;
+            if (n.getAttribute && n.getAttribute("data-wg-focus") === f.id) { found = n; return; }
+            (n.children || []).forEach ? Array.prototype.forEach.call(n.children || [], walk) : null;
+        })(box);
+        if (!found) return;
+        if (found.focus) found.focus();
+        try { if (f.start !== null && f.start !== undefined) found.setSelectionRange(f.start, f.end); }
+        catch (e) { /* not a text input */ }
+    }
+
+    function renderHostInner() {
         var box = $("wg-host-body");
         clear(box);
 
@@ -1497,6 +1846,11 @@
 
     /* Pure helpers, exported so the headless gjs tests can drive them. */
     window.WGPeers = { compute: {
+        filterCounts: filterCounts, filterPeers: filterPeers,
+        pruneSelection: pruneSelection, setAllShown: setAllShown, selectedKeys: selectedKeys,
+        chunk: chunk, matchClients: matchClients, buildBulkCommands: buildBulkCommands,
+        keySummary: keySummary, bulkRemoveSchema: bulkRemoveSchema,
+        peerRemoveSchema: peerRemoveSchema, handshakeHealth: handshakeHealth,
         buildSections: buildSections,
         parseSections: parseSections,
         parseRc: parseRc

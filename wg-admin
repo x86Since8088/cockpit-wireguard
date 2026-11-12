@@ -464,6 +464,7 @@ import os, shutil, sys, tempfile, yaml
 path, action, pub = sys.argv[1], sys.argv[2], sys.argv[3]
 aips = [x for x in (sys.argv[4].split(',') if len(sys.argv) > 4 else []) if x]
 ifname = os.environ['WGADMIN_IF']
+pubs = set(x for x in pub.split(',') if x)
 
 
 class Q(str):
@@ -513,6 +514,11 @@ elif action == 'remove':
     if found is not None:
         peers.remove(found)
         changed = True
+elif action == 'remove-many':
+    for p in list(peers):
+        if isinstance(p, dict) and (p.get('keys') or {}).get('public') in pubs:
+            peers.remove(p)
+            changed = True
 else:
     sys.exit('unknown action: ' + action)
 
@@ -567,6 +573,15 @@ persist_peer() {
 # and anything already handed out to a client.
 used_octets() {
     local o d ip line a
+    # Trashed clients keep their address reserved until purged (restorable).
+    # `used_octets notrash` is the live-only view restore uses to detect reuse.
+    if [[ "${1:-}" != "notrash" ]]; then
+        while read -r ip; do
+            if [[ "$ip" =~ ^${TUNNEL_PREFIX//./\\.}\.([0-9]{1,3})$ ]]; then
+                echo "${BASH_REMATCH[1]}"
+            fi
+        done < <(trash_held_ips)
+    fi
     for o in "${RESERVED_OCTETS[@]}"; do echo "$o"; done
     while read -r line; do
         for a in $(tr ',' ' ' <<<"$line"); do
@@ -625,6 +640,8 @@ with_lock() {
     exec 9>"$LOCK_FILE"
     chmod 0600 "$LOCK_FILE" 2>/dev/null || true
     flock -w 15 9 || die "could not acquire ${LOCK_FILE} within 15s"
+    # Every locked verb opportunistically destroys trash past its retention.
+    trash_expire || true
 }
 
 # --------------------------------------------------------------- IPAM state --
@@ -770,6 +787,7 @@ pool_taken() {
     if [[ "$net" == "tunnel" ]]; then
         for o in "${RESERVED_OCTETS[@]}"; do printf '%s.%s\n' "$prefix" "$o"; done
         client_store_ips
+        trash_held_ips
     fi
     return 0
 }
@@ -1373,9 +1391,136 @@ verb_del_config() {
     jq -nc '{ok: true}'
 }
 
+# ------------------------------------------------------------ trash / undelete --
+#
+# Nothing a delete verb removes is destroyed at once. Client directories and
+# host-peer snapshots go to ${TRASH_DIR}/<id>/ (0700, files 0600) and are
+# restorable for TRASH_DAYS days; `trash-purge` (or the daily timer, or any
+# later mutating verb) destroys them for real with shred -u. The directory holds
+# private keys and pre-shared keys, so it is root-only and trash-list prints
+# METADATA ONLY - never a key that is not already a public identifier.
+#
+# Layout:  <id>/meta.json            always
+#          <id>/client/              kind=client: the moved client directory
+#          <id>/psk                  kind=peer, only when the peer had a PSK
+# id = UTC timestamp + "-" + label (client name, or "peer-" + 8 key characters).
+
+TRASH_DAYS_DEFAULT=30
+TRASH_DIR="${STATE_DIR}/trash"
+TRASH_ID_RE='^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9_-]{1,40}$'
+B64KEY_RE='^[A-Za-z0-9+/]{43}=$'
+IFACE_RE='^[A-Za-z0-9_.-]{1,15}$'
+
+# Retention comes from TRASH_DAYS in the root-owned wg-admin.conf (parsed, never
+# sourced) and nowhere else - no environment variable steers it.
+trash_days() {
+    local v
+    v="$(conf_get TRASH_DAYS "$TRASH_DAYS_DEFAULT")"
+    if [[ "$v" =~ ^[0-9]{1,4}$ ]] && ((10#$v >= 1)); then printf '%d' "$((10#$v))"
+    else printf '%d' "$TRASH_DAYS_DEFAULT"; fi
+}
+
+# The clock. WG_ADMIN_NOW is honoured ONLY with WG_ADMIN_TEST_MODE=1 AND a
+# non-root caller: a root helper whose expiry clock an env var can move could be
+# made to purge the whole trash early.
+now_epoch() {
+    if [[ "${WG_ADMIN_TEST_MODE:-0}" == "1" && ${EUID:-$(id -u)} -ne 0 \
+          && "${WG_ADMIN_NOW:-}" =~ ^[0-9]{9,11}$ ]]; then
+        printf '%s' "$WG_ADMIN_NOW"
+    else
+        date +%s
+    fi
+}
+
+trash_init() { mkdir -p "$TRASH_DIR"; chmod 0700 "$TRASH_DIR"; }
+
+# Reserve a fresh <id> directory (mkdir is the atomic claim). Prints the id.
+trash_new_id() {
+    local label="$1" now="$2" ts cand n=1
+    ts="$(date -u -d "@$now" +%Y%m%dT%H%M%SZ)" || return 1
+    trash_init
+    cand="${ts}-${label}"
+    while ! mkdir -m 0700 "$TRASH_DIR/$cand" 2>/dev/null; do
+        n=$((n + 1)); ((n < 100)) || return 1
+        cand="${ts}-${label}-${n}"
+    done
+    printf '%s' "$cand"
+}
+
+trash_ids() {
+    local m id
+    for m in "$TRASH_DIR"/*/meta.json; do
+        id="${m%/meta.json}"; id="${id##*/}"
+        [[ "$id" =~ $TRASH_ID_RE ]] && printf '%s\n' "$id"
+    done
+    return 0
+}
+
+# Destroy one entry for real. The id is re-validated so a path can never be
+# smuggled in, and a symlink is refused rather than followed.
+trash_destroy() {
+    local id="$1" dir="$TRASH_DIR/$1"
+    [[ "$id" =~ $TRASH_ID_RE ]] || return 1
+    [[ -d "$dir" && ! -L "$dir" ]] || return 1
+    find "$dir" -type f -exec shred -u {} + 2>/dev/null || true
+    rm -rf -- "$dir"
+}
+
+# Drop every entry whose expires_at has passed. Called with the lock held.
+trash_expire() {
+    local id exp now
+    [[ -d "$TRASH_DIR" ]] || return 0
+    now="$(now_epoch)"
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        exp="$(jq -r '.expires_at // 0' "$TRASH_DIR/$id/meta.json" 2>/dev/null)" || exp=0
+        [[ "$exp" =~ ^[0-9]+$ ]] || continue
+        if ((exp <= now)); then trash_destroy "$id" || true; fi
+    done < <(trash_ids)
+    return 0
+}
+
+# IPs of trashed clients, one per line: held until purge so restore cannot collide.
+trash_held_ips() {
+    local m
+    for m in "$TRASH_DIR"/*/meta.json; do
+        jq -r 'select(.kind == "client") | .ip // empty' "$m" 2>/dev/null || true
+    done
+    return 0
+}
+
+# Move client NAME into the trash; prints the new id. Lock held.
+trash_client() {
+    local name="$1" d ip="" pub="" cfgs now id tdir days
+    d="$(client_dir "$name")"
+    if [[ -f "$d/ip" ]]; then ip="$(<"$d/ip")"; fi
+    if [[ -f "$d/publickey" ]]; then pub="$(<"$d/publickey")"; fi
+    cfgs="$(client_configs "$name" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+    now="$(now_epoch)"; days="$(trash_days)"
+    id="$(trash_new_id "$name" "$now")" || return 1
+    tdir="$TRASH_DIR/$id"
+    if ! mv -- "$d" "$tdir/client"; then rmdir "$tdir" 2>/dev/null || true; return 1; fi
+    if ! jq -nc --arg id "$id" --arg name "$name" --arg ip "$ip" --arg pub "$pub" \
+            --arg iface "$WG_IF" --argjson cfgs "$cfgs" --argjson now "$now" \
+            --argjson days "$days" '
+            {id: $id, kind: "client", name: $name, ip: $ip, iface: $iface,
+             public_key: $pub, allowed_ips: (if $ip == "" then [] else [$ip + "/32"] end),
+             configs: $cfgs, deleted_at: $now, expires_at: ($now + $days * 86400)}' \
+            > "$tdir/meta.json"; then
+        mv -- "$tdir/client" "$d" || true
+        rm -rf -- "$tdir"
+        return 1
+    fi
+    printf '%s' "$id"
+}
+
+# netplan removal for many peers in ONE rewrite (action remove-many, csv of keys).
+persist_peers_remove() { persist_peer remove-many "$1" ""; }
+
 verb_del_client() {
-    local d pub persisted="true"
-    local -a pos=()
+    local d pub name id persisted="true" multi=0 err_msg
+    local -a pos=() pubs=() rows=()
+    local -A seen=()
     while (($#)); do
         case "$1" in
             --) shift ;;
@@ -1383,29 +1528,293 @@ verb_del_client() {
             *)  pos+=("$1"); shift ;;
         esac
     done
-    local name="${pos[0]:-}"
-    [[ -n "$name" ]] || die "del-client: NAME is required"
-    valid_name "$name" || die "invalid client name: $name"
+    ((${#pos[@]})) || die "del-client: NAME is required"
+    for name in "${pos[@]}"; do
+        valid_name "$name" || die "invalid client name: $name"
+    done
+    if ((${#pos[@]} > 1)); then multi=1; fi
 
     with_lock
-    d="$(client_dir "$name")"
-    if [[ ! -d "$d" ]]; then
+    for name in "${pos[@]}"; do
+        if [[ -n "${seen[$name]:-}" ]]; then
+            rows+=("$(jq -nc --arg n "$name" '{name: $n, ok: false, error: "duplicate name"}')")
+            continue
+        fi
+        seen[$name]=1
+        d="$(client_dir "$name")"
+        if [[ ! -d "$d" ]]; then
+            rows+=("$(jq -nc --arg n "$name" '{name: $n, ok: true, note: "no such client"}')")
+            continue
+        fi
+        pub=""
+        if [[ -f "$d/publickey" ]]; then pub="$(<"$d/publickey")"; fi
+        if ! id="$(trash_client "$name")"; then
+            rows+=("$(jq -nc --arg n "$name" '{name: $n, ok: false, error: "could not move the client into the trash; nothing was changed"}')")
+            continue
+        fi
+        if [[ -n "$pub" ]]; then
+            wg set "$WG_IF" peer "$pub" remove || err "wg set peer remove failed (continuing)"
+            pubs+=("$pub")
+        fi
+        rows+=("$(jq -nc --arg n "$name" --arg id "$id" '{name: $n, ok: true, trash_id: $id}')")
+    done
+    if ((${#pubs[@]})); then
+        persist_peers_remove "$(IFS=,; printf '%s' "${pubs[*]}")" || persisted="false"
+    fi
+
+    if ((multi)); then
+        printf '%s\n' "${rows[@]}" | jq -sc --argjson persisted "$persisted" \
+            --argjson needs_apply "$NEEDS_APPLY" '
+            {results: ., deleted: (map(select(.trash_id)) | length),
+             failed: (map(select(.ok | not)) | length),
+             persisted: $persisted, needs_apply: $needs_apply}'
+        return 0
+    fi
+    if [[ "$(jq -r '.ok' <<<"${rows[0]}")" != "true" ]]; then
+        err_msg="$(jq -r '.error' <<<"${rows[0]}")"
+        die "$err_msg"
+    fi
+    if [[ "$(jq -r 'has("note")' <<<"${rows[0]}")" == "true" ]]; then
         jq -nc '{ok: true, persisted: true, needs_apply: false, note: "no such client"}'
         return 0
     fi
-    pub=""
-    if [[ -f "$d/publickey" ]]; then pub="$(<"$d/publickey")"; fi
+    jq -nc --argjson persisted "$persisted" --argjson needs_apply "$NEEDS_APPLY" \
+        --arg id "$(jq -r '.trash_id' <<<"${rows[0]}")" \
+        '{ok: true, persisted: $persisted, needs_apply: $needs_apply, trash_id: $id}'
+}
 
-    if [[ -n "$pub" ]]; then
-        wg set "$WG_IF" peer "$pub" remove || err "wg set peer remove failed (continuing)"
-        persist_peer remove "$pub" || persisted="false"
+# peer-remove IFACE KEY [KEY...]: snapshot each peer into the trash, then remove
+# them all with ONE `wg set`. Runtime only, exactly like the page's old raw
+# `wg set ... remove`; the PSK goes to a 0600 file in the entry, never to stdout.
+verb_peer_remove() {
+    local iface="${1:-}" k pub psk ep aips hs rx tx ka now days id tdir
+    shift || true
+    local -a keys=() rows=() wgargs=() ids=() okkeys=()
+    local -A ROW=() seen=() D_PSK=() D_EP=() D_AIPS=() D_KA=() T_ID=()
+    [[ -n "$iface" ]] || die "peer-remove: IFACE is required"
+    [[ "$iface" =~ $IFACE_RE ]] || die "invalid interface name: $iface"
+    (($#)) || die "peer-remove: at least one KEY is required"
+    for k in "$@"; do
+        [[ "$k" =~ $B64KEY_RE ]] || die "not a WireGuard public key: $k"
+    done
+
+    with_lock
+    wg show interfaces 2>/dev/null | tr ' ' '\n' | grep -Fxq -- "$iface" \
+        || die "no such WireGuard interface: $iface"
+    # Peer lines have 8 fields; the interface line (private key first) has
+    # fewer and is skipped without its contents ever being stored.
+    while IFS=$'\t' read -r pub psk ep aips hs rx tx ka; do
+        [[ -n "$ka" ]] || continue
+        D_PSK[$pub]="$psk"; D_EP[$pub]="$ep"; D_AIPS[$pub]="$aips"; D_KA[$pub]="$ka"
+    done < <(wg show "$iface" dump 2>/dev/null || true)
+
+    now="$(now_epoch)"; days="$(trash_days)"
+    for k in "$@"; do
+        if [[ -n "${seen[$k]:-}" ]]; then
+            continue          # a repeated key is reported once
+        fi
+        seen[$k]=1
+        if [[ -z "${D_AIPS[$k]+x}" ]]; then
+            ROW[$k]="$(jq -nc --arg k "$k" '{key: $k, ok: false, error: "no such peer on this interface"}')"
+            continue
+        fi
+        if ! id="$(trash_new_id "peer-$(tr -dc 'A-Za-z0-9' <<<"${k:0:12}" | cut -c1-8)" "$now")"; then
+            ROW[$k]="$(jq -nc --arg k "$k" '{key: $k, ok: false, error: "could not create a trash entry"}')"; continue
+        fi
+        tdir="$TRASH_DIR/$id"
+        psk="${D_PSK[$k]}"; ep="${D_EP[$k]}"; aips="${D_AIPS[$k]}"; ka="${D_KA[$k]}"
+        [[ "$ep" == "(none)" ]] && ep=""
+        [[ "$aips" == "(none)" ]] && aips=""
+        [[ "$ka" =~ ^[0-9]+$ ]] || ka=0
+        local haspsk=false
+        if [[ -n "$psk" && "$psk" != "(none)" ]]; then
+            printf '%s\n' "$psk" > "$tdir/psk" && chmod 0600 "$tdir/psk" && haspsk=true
+        fi
+        if ! jq -nc --arg id "$id" --arg iface "$iface" --arg pub "$k" --arg aips "$aips" \
+                --arg ep "$ep" --argjson ka "$ka" --argjson haspsk "$haspsk" \
+                --argjson now "$now" --argjson days "$days" '
+                ($aips | split(",") | map(select(length > 0))) as $a
+                | {id: $id, kind: "peer", name: "", ip: ($a[0] // ""), iface: $iface,
+                   public_key: $pub, allowed_ips: $a, endpoint: $ep, keepalive: $ka,
+                   has_psk: $haspsk, configs: [], deleted_at: $now,
+                   expires_at: ($now + $days * 86400)}' > "$tdir/meta.json"; then
+            trash_destroy "$id" || true
+            ROW[$k]="$(jq -nc --arg k "$k" '{key: $k, ok: false, error: "could not write the trash entry"}')"
+            continue
+        fi
+        T_ID[$k]="$id"; okkeys+=("$k"); ids+=("$id"); wgargs+=(peer "$k" remove)
+    done
+
+    if ((${#okkeys[@]})); then
+        if wg set "$iface" "${wgargs[@]}"; then
+            for k in "${okkeys[@]}"; do
+                ROW[$k]="$(jq -nc --arg k "$k" --arg id "${T_ID[$k]}" '{key: $k, ok: true, trash_id: $id}')"
+            done
+        else
+            for k in "${okkeys[@]}"; do
+                trash_destroy "${T_ID[$k]}" || true
+                ROW[$k]="$(jq -nc --arg k "$k" '{key: $k, ok: false, error: "wg set failed; nothing was removed"}')"
+            done
+        fi
+    fi
+    for k in "$@"; do
+        if [[ -n "${ROW[$k]:-}" ]]; then rows+=("${ROW[$k]}"); unset 'ROW[$k]'; fi
+    done
+    printf '%s\n' "${rows[@]}" | jq -sc '
+        {results: ., removed: (map(select(.ok)) | length),
+         failed: (map(select(.ok | not)) | length)}'
+}
+
+verb_trash_list() {
+    local id m
+    local -a docs=()
+    with_lock
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        m="$TRASH_DIR/$id/meta.json"
+        # Explicit projection: whatever else a meta file holds, only these leave.
+        docs+=("$(jq -c '{id: (.id // ""), kind: (.kind // ""), name: (.name // ""),
+            ip: (.ip // ""), iface: (.iface // ""), public_key: (.public_key // ""),
+            allowed_ips: (.allowed_ips // []), endpoint: (.endpoint // ""),
+            keepalive: (.keepalive // 0), has_psk: (.has_psk // false),
+            configs: (.configs // []), deleted_at: (.deleted_at // 0),
+            expires_at: (.expires_at // 0)}' "$m" 2>/dev/null)") || true
+    done < <(trash_ids)
+    if ((${#docs[@]})); then
+        printf '%s\n' "${docs[@]}" | jq -sc --argjson d "$(trash_days)" \
+            '{retention_days: $d, entries: (map(select(. != null)) | sort_by(.deleted_at) | reverse)}'
+    else
+        jq -nc --argjson d "$(trash_days)" '{retention_days: $d, entries: []}'
+    fi
+}
+
+verb_trash_purge() {
+    local arg id mode="" now exp
+    local -a ids=() rows=()
+    while (($#)); do
+        case "$1" in
+            --all)     mode="all"; shift ;;
+            --expired) mode="expired"; shift ;;
+            --)        shift ;;
+            -*)        die "trash-purge: unknown option: $1" ;;
+            *)         ids+=("$1"); shift ;;
+        esac
+    done
+    [[ -n "$mode" || ${#ids[@]} -gt 0 ]] || die "trash-purge: give --all, --expired or one or more ID"
+    [[ -z "$mode" || ${#ids[@]} -eq 0 ]] || die "trash-purge: --all/--expired cannot be combined with IDs"
+    for id in "${ids[@]}"; do
+        [[ "$id" =~ $TRASH_ID_RE ]] || die "invalid trash id: $id"
+    done
+
+    with_lock          # also expires anything past its date
+    if [[ "$mode" == "all" ]]; then
+        while IFS= read -r id; do [[ -n "$id" ]] && ids+=("$id"); done < <(trash_ids)
+    fi
+    # --expired needs no extra work: with_lock just did it. Report what remains
+    # as an empty result set rather than a guess about what was removed.
+    for id in "${ids[@]}"; do
+        if trash_destroy "$id"; then
+            rows+=("$(jq -nc --arg id "$id" '{id: $id, ok: true}')")
+        else
+            rows+=("$(jq -nc --arg id "$id" '{id: $id, ok: false, error: "no such trash entry"}')")
+        fi
+    done
+    if ((${#rows[@]})); then
+        printf '%s\n' "${rows[@]}" | jq -sc '{results: ., purged: (map(select(.ok)) | length)}'
+    else
+        jq -nc '{results: [], purged: 0}'
+    fi
+}
+
+# Restore one entry. Prints a JSON row; never dies (so a batch carries on).
+restore_one() {
+    local id="$1" dir meta kind name ip pub iface ep ka n cfgn
+    local -a aips=() sargs=()
+    dir="$TRASH_DIR/$id"
+    if [[ ! "$id" =~ $TRASH_ID_RE || ! -f "$dir/meta.json" ]]; then
+        jq -nc --arg id "$id" '{id: $id, ok: false, error: "no such trash entry"}'; return 0
+    fi
+    meta="$(<"$dir/meta.json")"
+    kind="$(jq -r '.kind' <<<"$meta")"; name="$(jq -r '.name // ""' <<<"$meta")"
+    ip="$(jq -r '.ip // ""' <<<"$meta")"; pub="$(jq -r '.public_key // ""' <<<"$meta")"
+    iface="$(jq -r '.iface // ""' <<<"$meta")"
+
+    if [[ "$kind" == "client" ]]; then
+        local d o live
+        valid_name "$name" || { jq -nc --arg id "$id" '{id: $id, ok: false, error: "corrupt entry: bad client name"}'; return 0; }
+        d="$(client_dir "$name")"
+        if [[ -e "$d" ]]; then
+            jq -nc --arg id "$id" --arg n "$name" \
+               '{id: $id, ok: false, error: ("a client named " + $n + " exists now; delete or rename it first")}'; return 0
+        fi
+        if [[ ! -d "$dir/client" ]]; then
+            jq -nc --arg id "$id" '{id: $id, ok: false, error: "corrupt entry: client data missing"}'; return 0
+        fi
+        if [[ "$ip" =~ ^${TUNNEL_PREFIX//./\\.}\.([0-9]{1,3})$ ]]; then
+            o="${BASH_REMATCH[1]}"
+            live="$(used_octets notrash)"
+            if grep -qxF -- "$o" <<<"$live"; then
+                jq -nc --arg id "$id" --arg ip "$ip" \
+                   '{id: $id, ok: false, error: ("address " + $ip + " is in use by something else now")}'; return 0
+            fi
+        fi
+        mkdir -p "$CLIENTS_DIR"
+        if ! mv -- "$dir/client" "$d"; then
+            jq -nc --arg id "$id" '{id: $id, ok: false, error: "could not move the client back"}'; return 0
+        fi
+        cfgn="$(client_configs "$name" | grep -c . || true)"
+        if [[ -n "$pub" && "$cfgn" -gt 0 && -n "$ip" ]]; then
+            wg set "$WG_IF" peer "$pub" allowed-ips "$ip/32" || err "wg set peer add failed (continuing)"
+            persist_peer add "$pub" "$ip/32" || true
+        fi
+        trash_destroy "$id" || true
+        jq -nc --arg id "$id" '{id: $id, ok: true}'
+        return 0
     fi
 
-    find "$d" -type f -exec shred -u {} + 2>/dev/null || true
-    rm -rf "$d"
+    if [[ "$kind" == "peer" ]]; then
+        [[ "$iface" =~ $IFACE_RE && "$pub" =~ $B64KEY_RE ]] || { jq -nc --arg id "$id" '{id: $id, ok: false, error: "corrupt entry"}'; return 0; }
+        if ! wg show interfaces 2>/dev/null | tr ' ' '\n' | grep -Fxq -- "$iface"; then
+            jq -nc --arg id "$id" --arg i "$iface" '{id: $id, ok: false, error: ("interface " + $i + " does not exist now")}'; return 0
+        fi
+        if wg show "$iface" peers 2>/dev/null | grep -Fxq -- "$pub"; then
+            jq -nc --arg id "$id" '{id: $id, ok: false, error: "that peer is already present"}'; return 0
+        fi
+        n="$(jq -r '.allowed_ips | join(",")' <<<"$meta")"
+        ep="$(jq -r '.endpoint // ""' <<<"$meta")"; ka="$(jq -r '.keepalive // 0' <<<"$meta")"
+        sargs=(peer "$pub")
+        [[ -n "$n" ]] && sargs+=(allowed-ips "$n")
+        [[ -n "$ep" ]] && sargs+=(endpoint "$ep")
+        [[ "$ka" =~ ^[0-9]+$ && "$ka" -gt 0 ]] && sargs+=(persistent-keepalive "$ka")
+        [[ -f "$dir/psk" ]] && sargs+=(preshared-key "$dir/psk")
+        if ! wg set "$iface" "${sargs[@]}"; then
+            jq -nc --arg id "$id" '{id: $id, ok: false, error: "wg set failed; the entry is kept"}'; return 0
+        fi
+        trash_destroy "$id" || true
+        jq -nc --arg id "$id" '{id: $id, ok: true}'
+        return 0
+    fi
+    jq -nc --arg id "$id" '{id: $id, ok: false, error: "corrupt entry: unknown kind"}'
+}
 
-    jq -nc --argjson persisted "$persisted" --argjson needs_apply "$NEEDS_APPLY" \
-        '{ok: true, persisted: $persisted, needs_apply: $needs_apply}'
+verb_restore() {
+    local id
+    local -a rows=()
+    while (($#)); do
+        case "$1" in
+            --) shift ;;
+            -*) die "restore: unknown option: $1" ;;
+            *)  [[ "$1" =~ $TRASH_ID_RE ]] || die "invalid trash id: $1"
+                rows+=("$1"); shift ;;
+        esac
+    done
+    ((${#rows[@]})) || die "restore: at least one ID is required"
+    local -a ids=("${rows[@]}"); rows=()
+    with_lock
+    for id in "${ids[@]}"; do rows+=("$(restore_one "$id")"); done
+    printf '%s\n' "${rows[@]}" | jq -sc '
+        {results: ., restored: (map(select(.ok)) | length),
+         failed: (map(select(.ok | not)) | length)}'
 }
 
 verb_routing_status() {
@@ -1794,8 +2203,18 @@ verb_ipam_status() {
     state="$(ipam_load)" || die "cannot read ipam state"
     free_json="$(pool_taken "$net" state | sort -u | pool_free "$prefix" \
                  | jq -Rnc '[inputs]')"
+    # Trashed clients' addresses stay held (not free) until purge; additive key.
+    local held_json="[]" hm
+    if [[ "$net" == "tunnel" ]]; then
+        held_json="$(for hm in "$TRASH_DIR"/*/meta.json; do
+                jq -c --arg p "$prefix." 'select(.kind == "client" and (.ip | startswith($p)))
+                    | {ip, name, trash_id: .id, restorable_until: .expires_at,
+                       note: ("held (deleted, restorable until " + (.expires_at | strftime("%Y-%m-%d")) + ")")}' \
+                    "$hm" 2>/dev/null || true
+            done | jq -sc '.')" || held_json="[]"
+    fi
     jq -nc --argjson state "$state" --arg p "$prefix." --arg net "$net" \
-           --arg cidr "$cidr" --argjson free "$free_json" \
+           --arg cidr "$cidr" --argjson free "$free_json" --argjson held "$held_json" \
            --argjson first "$IPAM_HOST_FIRST" --argjson last "$IPAM_HOST_LAST" '
         {pool: {net: $net, cidr: $cidr,
                 first: ($p + ($first | tostring)), last: ($p + ($last | tostring)),
@@ -1803,6 +2222,7 @@ verb_ipam_status() {
          reserved: [$state.reserved[] | select(.ip | startswith($p))],
          observed: [$state.observed[] | select(.ip | startswith($p))],
          free: $free,
+         held: $held,
          lru: ([$state.observed[] | select(.ip | startswith($p))]
                | sort_by(.last_seen // ""))}'
 }
@@ -2002,7 +2422,11 @@ wg-admin - WireGuard client/config helper (one JSON object on stdout)
   wg-admin add-config NAME CFG --preset tunnel-only|lab|lan|full [tunables]
   wg-admin get-config NAME CFG [--qr]
   wg-admin del-config NAME CFG
-  wg-admin del-client NAME
+  wg-admin del-client NAME [NAME...]      (moved to the trash, restorable)
+  wg-admin peer-remove IFACE KEY [KEY...] (runtime; snapshot to the trash)
+  wg-admin trash-list
+  wg-admin restore ID [ID...]
+  wg-admin trash-purge --all | --expired | ID [ID...]
   wg-admin routing-status
   wg-admin routing-set DEST on|off        (DEST also accepts ip_forward)
   wg-admin schema
@@ -2049,6 +2473,10 @@ main() {
         get-config)     need_root;                                   verb_get_config "$@" ;;
         del-config)     need_root; need_tools flock;                 verb_del_config "$@" ;;
         del-client)     need_root; need_tools wg python3 flock;      verb_del_client "$@" ;;
+        peer-remove)    need_root; need_tools wg flock;              verb_peer_remove "$@" ;;
+        trash-list)     need_root; need_tools flock;                 verb_trash_list "$@" ;;
+        restore)        need_root; need_tools wg python3 flock;      verb_restore "$@" ;;
+        trash-purge)    need_root; need_tools flock shred;           verb_trash_purge "$@" ;;
         routing-status) need_root; need_tools iptables ip;           verb_routing_status "$@" ;;
         routing-set)    need_root; need_tools iptables ip systemctl; verb_routing_set "$@" ;;
         schema)         need_root; need_tools wg ip iptables;        verb_schema "$@" ;;
