@@ -54,13 +54,14 @@ function delay(ms) {
     return new Promise(r => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => { r(); return GLib.SOURCE_REMOVE; }));
 }
 
-let polls = 0;           /* each poll starts with the `id -u` privilege probe */
+let polls = 0;           /* each poll's fast probe is ONE spawn containing the `id -u` section */
 let snapshotGen = 0;     /* bumped when the "peer removal" lands */
 globalThis.cockpit = {
     spawn(argv) {
         const script = argv[2] || "";
-        if (script === "id -u") polls++;
-        return delay(60).then(() => script === "id -u" ? "0\n" : "");
+        const fast = script.indexOf("@@S:privilege@@") >= 0;
+        if (fast) polls++;
+        return delay(60).then(() => "");
     }
 };
 
