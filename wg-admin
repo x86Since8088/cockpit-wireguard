@@ -1175,8 +1175,8 @@ verb_list() {
         cfgjson="$(client_configs "$name" | jq -Rsc 'split("\n") | map(select(length > 0))')"
         if [[ -n "$pub" ]] && peer_present "$pub"; then enabled=true; else enabled=false; fi
         jq -nc --arg name "$name" --arg ip "$ip" --argjson configs "$cfgjson" \
-               --argjson enabled "$enabled" \
-               '{name: $name, ip: $ip, configs: $configs, enabled: $enabled}'
+               --argjson enabled "$enabled" --arg pubkey "$pub" \
+               '{name: $name, ip: $ip, configs: $configs, enabled: $enabled, pubkey: $pubkey}'
       done; } | jq -sc '{clients: .}'
 }
 
