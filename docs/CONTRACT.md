@@ -59,7 +59,7 @@ what "access 192.168.2.0/24 via a second config" means.
 
 ```
 wg-admin catalogue                         -> { networks:[...], presets:{...} }
-wg-admin list                              -> { clients:[ {name, ip, configs:[...], enabled} ] }
+wg-admin list                              -> { clients:[ {name, ip, configs:[...], enabled, pubkey} ] }  (pubkey = WireGuard PUBLIC key, "" if none; never a private key or PSK)
 wg-admin new-client NAME [--ip A.B.C.D]    -> { name, ip, pubkey }
 wg-admin add-config NAME CFG --routes a,b  -> { name, config, allowed_ips, path }
 wg-admin get-config NAME CFG [--qr]        -> { conf: "<text>", qr: "<png data url>" }

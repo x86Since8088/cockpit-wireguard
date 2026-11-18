@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `wg-admin list`: each client now carries `pubkey` (its WireGuard public key, same field name as `new-client`; empty string if the client has none). Additive; existing fields unchanged. Lets edy-proxy-go find a peer by key for revocation.
+
 ## 1.2.1
 
 - Fix: the wg-trash-purge.service.in header comment contained a literal placeholder token, which install.sh's unrendered-placeholder check rejected, aborting the install after the payload was linked.
